@@ -4,7 +4,7 @@ Local macOS meeting recorder:
 
 1. watches for Google Meet, Teams, Zoom, Webex, or Whereby in browsers/apps
 2. asks before recording
-3. records the configured macOS audio input with `ffmpeg`
+3. records the configured macOS audio input with `ffmpeg` as `.wav`
 4. transcribes with local `whisper`
 5. optionally asks `claude -p` to clean the raw transcript into notes
 
@@ -110,3 +110,8 @@ Environment variables:
 - `MEETING_RECORDER_CLAUDE_MODEL`: optional Claude model alias.
 - `MEETING_RECORDER_POLL_SECONDS`: meeting detection interval. Default: `10`.
 - `MEETING_RECORDER_END_GRACE_SECONDS`: time to wait after meeting disappears before stopping. Default: `45`.
+- `MEETING_RECORDER_CHECK_IN_SECONDS`: while recording, ask whether to keep going after this many seconds. Default: `1800` (30 minutes). Set to `0` to disable.
+
+## Recording Reliability
+
+The tool records new meetings as `.wav` rather than `.m4a`. WAV files are larger, but they are much safer for long recordings because they remain easier to recover if the process is stopped unexpectedly. Older `.m4a` recordings without a finalized MP4 `moov` atom may not be transcribable.

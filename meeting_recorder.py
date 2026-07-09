@@ -27,6 +27,7 @@ LAUNCH_AGENT_PATH = Path(f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist").e
 AUDIO_DEVICE = os.environ.get("MEETING_RECORDER_AUDIO_DEVICE", "").strip()
 POLL_SECONDS = int(os.environ.get("MEETING_RECORDER_POLL_SECONDS", "10"))
 END_GRACE_SECONDS = int(os.environ.get("MEETING_RECORDER_END_GRACE_SECONDS", "45"))
+CHECK_IN_SECONDS = int(os.environ.get("MEETING_RECORDER_CHECK_IN_SECONDS", "1800"))
 WHISPER_MODEL = os.environ.get("MEETING_RECORDER_WHISPER_MODEL", "turbo")
 LANGUAGE = os.environ.get("MEETING_RECORDER_LANGUAGE", "")
 CLAUDE_MODEL = os.environ.get("MEETING_RECORDER_CLAUDE_MODEL", "")
@@ -151,6 +152,29 @@ def ask_to_record(reason: str) -> bool:
     return accepted
 
 
+def ask_continue_recording(reason: str, audio: Path) -> bool:
+    message = (
+        f"I am still recording this meeting:\n\n{reason}\n\n"
+        f"Audio file:\n{display_path(audio)}\n\n"
+        "Should I keep recording?"
+    )
+    script = (
+        "display dialog "
+        + applescript_quote(message)
+        + ' buttons {"Stop and transcribe", "Keep recording"} default button "Keep recording" '
+          'cancel button "Stop and transcribe" with title "Meeting Recorder" giving up after 60'
+    )
+    log_section("recording check-in", reason=reason, audio_file=display_path(audio))
+    try:
+        out = osascript(script, timeout=70)
+    except Exception as exc:
+        log(f"recording check-in failed or stop requested: {exc}")
+        return False
+    keep_going = "button returned:Keep recording" in out and "gave up:true" not in out
+    log(f"check-in response: {'keep recording' if keep_going else 'stop and transcribe'}")
+    return keep_going
+
+
 def active_processes() -> list[str]:
     proc = run(["ps", "axo", "comm="], timeout=10)
     if proc.returncode != 0:
@@ -252,10 +276,13 @@ def slug(value: str) -> str:
 def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
     ROOT.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = ROOT / f"{now}_{slug(reason)}.m4a"
+    path = ROOT / f"{now}_{slug(reason)}.wav"
     cmd = [
         "ffmpeg",
         "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "error",
         "-y",
         "-f",
         "avfoundation",
@@ -263,9 +290,7 @@ def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
         audio_device_arg(),
         "-vn",
         "-acodec",
-        "aac",
-        "-b:a",
-        "128k",
+        "pcm_s16le",
         str(path),
     ]
     log_section(
@@ -275,11 +300,10 @@ def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
         audio_input=audio_device_arg(),
     )
     log("ffmpeg command: " + shlex.join(cmd))
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3)
     if proc.poll() is not None:
-        stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
-        raise RuntimeError(f"ffmpeg exited early: {stderr[-2000:]}")
+        raise RuntimeError("ffmpeg exited early; run mrec doctor to check audio permissions and device selection")
     return proc, path
 
 
@@ -412,6 +436,7 @@ def watch() -> None:
             proc, audio = start_recording(reason)
             notify("Meeting Recorder", f"Recording started. Audio will save to {display_path(audio)}")
             last_seen = time.time()
+            last_check_in = time.time()
             while True:
                 current = detect_meeting()
                 if current:
@@ -419,6 +444,11 @@ def watch() -> None:
                 elif time.time() - last_seen >= END_GRACE_SECONDS:
                     log(f"meeting no longer detected for {END_GRACE_SECONDS}s; stopping recording")
                     break
+                if CHECK_IN_SECONDS > 0 and time.time() - last_check_in >= CHECK_IN_SECONDS:
+                    if not ask_continue_recording(reason, audio):
+                        log("recording stopped by check-in prompt")
+                        break
+                    last_check_in = time.time()
                 time.sleep(POLL_SECONDS)
         except Exception as exc:
             log(f"recording error: {exc}")
