@@ -13,6 +13,7 @@ import datetime as dt
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -24,6 +25,8 @@ ROOT = Path(os.environ.get("MEETING_RECORDER_DIR", "~/Meetings/Recordings")).exp
 LOG = Path(os.environ.get("MEETING_RECORDER_LOG", "~/Library/Logs/meeting-recorder.log")).expanduser()
 LAUNCH_AGENT_LABEL = "com.nsorros.meeting-recorder"
 LAUNCH_AGENT_PATH = Path(f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist").expanduser()
+STATE_DIR = Path(os.environ.get("MEETING_RECORDER_STATE_DIR", "~/.local/state/meeting-recorder")).expanduser()
+MANUAL_PID_FILE = STATE_DIR / "manual-recording.pid"
 AUDIO_DEVICE = os.environ.get("MEETING_RECORDER_AUDIO_DEVICE", "").strip()
 POLL_SECONDS = int(os.environ.get("MEETING_RECORDER_POLL_SECONDS", "10"))
 END_GRACE_SECONDS = int(os.environ.get("MEETING_RECORDER_END_GRACE_SECONDS", "45"))
@@ -94,6 +97,34 @@ def run(cmd: list[str], *, timeout: int = 20, check: bool = False) -> subprocess
 def command_exists(name: str) -> bool:
     return subprocess.run(["/usr/bin/env", "sh", "-c", f"command -v {shlex.quote(name)}"],
                           capture_output=True).returncode == 0
+
+
+def pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_manual_state() -> dict[str, str] | None:
+    if not MANUAL_PID_FILE.exists():
+        return None
+    state: dict[str, str] = {}
+    for line in MANUAL_PID_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            state[key] = value
+    try:
+        pid = int(state.get("pid", ""))
+    except ValueError:
+        return None
+    if not pid_is_running(pid):
+        MANUAL_PID_FILE.unlink(missing_ok=True)
+        return None
+    return state
 
 
 def osascript(script: str, timeout: int = 20) -> str:
@@ -508,6 +539,68 @@ def record_once(label: str) -> None:
         print(f"Transcript: {display_path(final)}")
 
 
+def record_daemon(label: str) -> int:
+    stop_requested = False
+
+    def stop_handler(signum: int, frame: object) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGINT, stop_handler)
+    signal.signal(signal.SIGTERM, stop_handler)
+
+    proc, audio = start_recording(label)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    MANUAL_PID_FILE.write_text(
+        f"pid={os.getpid()}\nlabel={label}\naudio={audio}\nstarted_at={dt.datetime.now().isoformat(timespec='seconds')}\n",
+        encoding="utf-8",
+    )
+    notify("Meeting Recorder", f"Manual recording started: {label}")
+    try:
+        while not stop_requested:
+            time.sleep(1)
+    finally:
+        stop_recording(proc)
+        MANUAL_PID_FILE.unlink(missing_ok=True)
+
+    if audio.exists() and audio.stat().st_size > 1024:
+        try:
+            notify("Meeting Recorder", "Manual recording stopped. Transcribing now.")
+            final = transcribe_audio(audio)
+            alert("Manual transcript ready", f"Saved notes:\n{display_path(final)}\n\nAudio:\n{display_path(audio)}")
+            return 0
+        except Exception as exc:
+            log(f"manual transcription error: {exc}")
+            alert("Manual transcription failed", f"{exc}\n\nAudio:\n{display_path(audio)}\n\nLog:\n{display_path(LOG)}")
+            return 1
+    log(f"manual recording missing or tiny: {audio}")
+    return 1
+
+
+def manual_recording_start(label: str) -> int:
+    state = read_manual_state()
+    if state:
+        print(f"Manual recording already running: pid {state.get('pid')} ({state.get('label', 'manual')})")
+        return 0
+    log_file = LOG.open("a", encoding="utf-8")
+    cmd = [sys.executable, str(Path(__file__).resolve()), "record-daemon", label]
+    subprocess.Popen(cmd, stdout=log_file, stderr=log_file, start_new_session=True)
+    print(f"Started manual recording: {label}")
+    print(f"Log: {display_path(LOG)}")
+    return 0
+
+
+def manual_recording_stop() -> int:
+    state = read_manual_state()
+    if not state:
+        print("No manual recording is running.")
+        return 0
+    pid = int(state["pid"])
+    os.kill(pid, signal.SIGTERM)
+    print(f"Stopping manual recording pid {pid}. It will transcribe after the audio finalizes.")
+    return 0
+
+
 def doctor() -> int:
     ok = True
     for binary in ("ffmpeg", "whisper", "claude", "osascript"):
@@ -645,6 +738,11 @@ def main() -> int:
     sub.add_parser("start", help="install and start the login background watcher")
     sub.add_parser("stop", help="stop the login background watcher")
     sub.add_parser("status", help="show whether the login background watcher is running")
+    manual_start = sub.add_parser("record-start", help="start a manual background recording")
+    manual_start.add_argument("label", nargs="?", default="manual-meeting")
+    sub.add_parser("record-stop", help="stop the manual background recording and transcribe it")
+    daemon = sub.add_parser("record-daemon", help=argparse.SUPPRESS)
+    daemon.add_argument("label", nargs="?", default="manual-meeting")
     args = parser.parse_args()
 
     if args.command == "watch":
@@ -667,6 +765,12 @@ def main() -> int:
         return stop_launch_agent()
     if args.command == "status":
         return status_launch_agent()
+    if args.command == "record-start":
+        return manual_recording_start(args.label)
+    if args.command == "record-stop":
+        return manual_recording_stop()
+    if args.command == "record-daemon":
+        return record_daemon(args.label)
     raise AssertionError(args.command)
 
 

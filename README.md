@@ -16,6 +16,8 @@ Local macOS meeting recorder:
 ~/code/meeting-recorder/mrec doctor
 ~/code/meeting-recorder/mrec watch
 ~/code/meeting-recorder/mrec record test-meeting
+~/code/meeting-recorder/mrec record-start menubar-manual
+~/code/meeting-recorder/mrec record-stop
 ~/code/meeting-recorder/mrec transcribe ~/Meetings/Recordings/example.m4a
 ```
 
@@ -96,6 +98,35 @@ Stop it:
 ```
 
 If you set environment variables such as `MEETING_RECORDER_AUDIO_DEVICE`, run `mrec start` again so the LaunchAgent plist is rewritten with the current values.
+
+## Menu Bar
+
+An xbar/SwiftBar-compatible menu plugin is included at:
+
+```sh
+~/code/meeting-recorder/menu-bar/meeting-recorder.1m.py
+```
+
+It is installed as:
+
+```sh
+~/Library/Application Support/xbar/plugins/meeting-recorder.1m.py
+```
+
+The menu shows:
+
+- `MR OFF`: watcher stopped and no manual recording
+- `MR ON`: login watcher running
+- `MR REC`: manual recording running
+
+Menu actions:
+
+- start/stop the login watcher
+- start a manual recording
+- stop the manual recording and transcribe it
+- open recordings
+- open logs
+- run doctor
 
 ## Configuration
 
