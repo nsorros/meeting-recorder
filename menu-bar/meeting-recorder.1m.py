@@ -53,6 +53,10 @@ def watcher_running() -> bool:
     return proc.returncode == 0 and "running" in proc.stdout
 
 
+def menu_title(text: str, sfimage: str) -> None:
+    print(f"{text} | sfimage={sfimage}")
+
+
 def item(title: str, command: str, *params: str, refresh: bool = True, terminal: bool = False) -> None:
     bits = [f"bash={command}", f"terminal={'true' if terminal else 'false'}"]
     for i, param in enumerate(params, start=1):
@@ -67,11 +71,11 @@ def main() -> None:
     watcher = watcher_running()
 
     if manual:
-        print("MR REC")
+        menu_title("REC", "record.circle.fill")
     elif watcher:
-        print("MR ON")
+        menu_title("MR", "waveform")
     else:
-        print("MR OFF")
+        menu_title("MR", "waveform")
 
     print("---")
     print(f"Watcher: {'running' if watcher else 'stopped'}")

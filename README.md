@@ -115,9 +115,8 @@ It is installed as:
 
 The menu shows:
 
-- `MR OFF`: watcher stopped and no manual recording
-- `MR ON`: login watcher running
-- `MR REC`: manual recording running
+- waveform `MR`: watcher state / idle
+- filled record circle `REC`: manual recording running
 
 Menu actions:
 
