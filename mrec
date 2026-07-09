@@ -1,0 +1,2 @@
+#!/usr/bin/env sh
+exec /usr/bin/env python3 "$(dirname "$0")/meeting_recorder.py" "$@"
