@@ -13,9 +13,11 @@ import datetime as dt
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -27,6 +29,13 @@ LAUNCH_AGENT_LABEL = "com.nsorros.meeting-recorder"
 LAUNCH_AGENT_PATH = Path(f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist").expanduser()
 STATE_DIR = Path(os.environ.get("MEETING_RECORDER_STATE_DIR", "~/.local/state/meeting-recorder")).expanduser()
 MANUAL_PID_FILE = STATE_DIR / "manual-recording.pid"
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+# Notifier app: gives notifications the Meeting Recorder logo instead of the
+# generic osascript icon. Built by `mrec install-app`; notify() falls back to
+# osascript when it is not installed.
+NOTIFIER_APP = Path("~/Applications/Meeting Recorder.app").expanduser()
+NOTIFIER_BUNDLE_ID = "com.nsorros.meeting-recorder-notifier"
+NOTIFY_QUEUE = STATE_DIR / "notify-queue"
 AUDIO_DEVICE = os.environ.get("MEETING_RECORDER_AUDIO_DEVICE", "").strip()
 # Capture sample rate for the output WAV. The bare built-in mic sometimes gets
 # negotiated down to 24 kHz with dropouts; pinning the output rate keeps files
@@ -55,6 +64,13 @@ WHISPER_NO_SPEECH_THRESHOLD = os.environ.get("MEETING_RECORDER_NO_SPEECH_THRESHO
 WHISPER_HALLUCINATION_SILENCE_THRESHOLD = os.environ.get("MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD", "2").strip()
 CLAUDE_MODEL = os.environ.get("MEETING_RECORDER_CLAUDE_MODEL", "")
 DISABLE_CLAUDE = os.environ.get("MEETING_RECORDER_DISABLE_CLAUDE", "").lower() in {"1", "true", "yes"}
+# Speaker labels. The Claude cleanup always attributes turns to speakers from
+# context (names if mentioned, else consistent role labels). For true acoustic
+# per-person diarization, set MEETING_RECORDER_DIARIZE=1 with whisperx installed
+# and a Hugging Face token (see README > Speaker Labels); when that succeeds its
+# speaker-tagged transcript is fed to the cleanup instead of the plain one.
+DIARIZE = os.environ.get("MEETING_RECORDER_DIARIZE", "").lower() in {"1", "true", "yes"}
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
 
 BROWSER_APPS = {
     "Google Chrome": "chrome",
@@ -155,6 +171,17 @@ def osascript(script: str, timeout: int = 20) -> str:
 
 
 def notify(title: str, text: str) -> None:
+    # Prefer the branded notifier app (shows the Meeting Recorder logo). It
+    # drains a queue directory, so we drop a "<title>\n<body>" file and open it.
+    if NOTIFIER_APP.exists():
+        try:
+            NOTIFY_QUEUE.mkdir(parents=True, exist_ok=True)
+            fname = f"{time.time_ns()}-{os.getpid()}.notify"
+            (NOTIFY_QUEUE / fname).write_text(f"{title}\n{text}", encoding="utf-8")
+            subprocess.run(["open", "-a", str(NOTIFIER_APP)], capture_output=True, timeout=10)
+            return
+        except Exception as exc:
+            log(f"notifier app failed ({exc}); falling back to osascript")
     try:
         osascript(f'display notification {applescript_quote(text)} with title {applescript_quote(title)}')
     except Exception as exc:
@@ -454,14 +481,61 @@ def transcribe_audio(audio: Path) -> Path:
             raise RuntimeError(f"whisper produced no txt output in {out_dir}")
         raw_txt = candidates[0]
 
+    diarized_txt = diarize_with_whisperx(audio, out_dir) if DIARIZE else None
+
     final_md = out_dir / f"{audio.stem}.meeting.md"
     if DISABLE_CLAUDE:
         log("claude cleanup disabled; writing basic markdown transcript")
-        write_basic_meeting_md(raw_txt, final_md, audio)
+        write_basic_meeting_md(diarized_txt or raw_txt, final_md, audio)
     else:
-        clean_with_claude(raw_txt, final_md, audio)
+        clean_with_claude(raw_txt, final_md, audio, diarized_txt=diarized_txt)
     log_section("transcription finished", final_notes=display_path(final_md), raw_transcript=display_path(raw_txt))
     return final_md
+
+
+def diarize_with_whisperx(audio: Path, out_dir: Path) -> Path | None:
+    """Optional true acoustic diarization via the whisperx CLI.
+
+    Returns a path to a transcript whose lines are prefixed with speaker tags
+    (e.g. ``[SPEAKER_00]``), or None if whisperx is unavailable, no HF token is
+    set, or the run fails. Never raises — diarization is best-effort and the
+    plain Whisper transcript remains the fallback.
+    """
+    if not command_exists("whisperx"):
+        log("diarization requested but whisperx is not installed; using plain transcript (see README > Speaker Labels)")
+        return None
+    if not HF_TOKEN:
+        log("diarization requested but no Hugging Face token (HF_TOKEN) is set; using plain transcript")
+        return None
+    dia_dir = out_dir / "diarization"
+    dia_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "whisperx", str(audio),
+        "--model", WHISPER_MODEL,
+        "--diarize",
+        "--hf_token", HF_TOKEN,
+        "--output_dir", str(dia_dir),
+        "--output_format", "txt",
+    ]
+    if LANGUAGE:
+        cmd.extend(["--language", LANGUAGE])
+    log_section("diarization started", audio_file=display_path(audio), engine="whisperx")
+    log("whisperx command: " + shlex.join(c if c != HF_TOKEN else "<hf_token>" for c in cmd))
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60 * 60)
+    except Exception as exc:
+        log(f"diarization failed to run ({exc}); using plain transcript")
+        return None
+    (dia_dir / "whisperx.log").write_text(proc.stdout + "\n" + proc.stderr, encoding="utf-8")
+    if proc.returncode != 0:
+        log(f"whisperx exited {proc.returncode}; using plain transcript (see {display_path(dia_dir / 'whisperx.log')})")
+        return None
+    candidates = sorted(dia_dir.glob("*.txt"))
+    if not candidates:
+        log("whisperx produced no txt output; using plain transcript")
+        return None
+    log(f"diarization succeeded: {display_path(candidates[0])}")
+    return candidates[0]
 
 
 def write_basic_meeting_md(raw_txt: Path, final_md: Path, audio: Path) -> None:
@@ -472,25 +546,47 @@ def write_basic_meeting_md(raw_txt: Path, final_md: Path, audio: Path) -> None:
     )
 
 
-def clean_with_claude(raw_txt: Path, final_md: Path, audio: Path) -> None:
+def clean_with_claude(raw_txt: Path, final_md: Path, audio: Path, diarized_txt: Path | None = None) -> None:
+    transcript_text = raw_txt.read_text(encoding="utf-8", errors="replace")
+    if diarized_txt is not None:
+        speaker_note = (
+            "The transcript below already carries acoustic speaker tags (e.g. [SPEAKER_00]) "
+            "from diarization. Keep those turn boundaries. Map each tag to a real name if the "
+            "content makes it unambiguous (e.g. someone is addressed by name or introduces "
+            "themselves); otherwise keep a stable label like \"Speaker 1 (host)\". State the mapping "
+            "in a short Speakers legend at the top."
+        )
+        transcript_text = diarized_txt.read_text(encoding="utf-8", errors="replace")
+    else:
+        speaker_note = (
+            "Attribute each turn to a speaker. The transcript has no speaker tags, so infer them "
+            "from turn-taking and content: use a person's real name when it is clearly identifiable "
+            "(mentioned, introduced, or addressed), otherwise a consistent role label like "
+            "\"Speaker 1 (host/presenter)\" or \"Speaker 2 (client)\". Do NOT guess specific names "
+            "without support. Add a short Speakers legend at the top listing who each label is."
+        )
     prompt = f"""
 You are cleaning a machine-generated transcript of a meeting.
 
 Input audio path: {audio}
 Raw transcript path: {raw_txt}
 
+Speaker labels: {speaker_note}
+
 Produce markdown with:
 - Title inferred from content if possible
 - Date/time from the filename if useful
-- Cleaned transcript, preserving meaning and uncertainty
+- Speakers legend (label -> who they are, as far as identifiable)
+- Cleaned transcript as attributed turns in the form "**Name:** text", preserving meaning and uncertainty
 - Decisions
 - Action items with owner if identifiable
 - Open questions
 
-Do not invent details not supported by the raw transcript.
+Do not invent details not supported by the raw transcript. Attribution should be
+your best supported reading; flag it as uncertain rather than fabricating names.
 
 Raw transcript:
-{raw_txt.read_text(encoding="utf-8", errors="replace")}
+{transcript_text}
 """.strip()
     cmd = ["claude", "-p"]
     if CLAUDE_MODEL:
@@ -711,6 +807,75 @@ def doctor() -> int:
     return 0 if ok else 1
 
 
+def build_notifier_app() -> Path:
+    """Build/refresh the branded notifier app in ~/Applications.
+
+    Compiles the AppleScript applet (assets/notify.applescript), gives it the
+    microphone icon rendered from assets/icon.svg, sets a stable bundle id, and
+    registers it with Launch Services. Best-effort: if rsvg-convert/iconutil are
+    missing the app is still built, just with the default applet icon.
+    """
+    src = ASSETS_DIR / "notify.applescript"
+    icon_svg = ASSETS_DIR / "icon.svg"
+    if not src.exists():
+        raise RuntimeError(f"missing applet source: {src}")
+    NOTIFIER_APP.parent.mkdir(parents=True, exist_ok=True)
+    if NOTIFIER_APP.exists():
+        shutil.rmtree(NOTIFIER_APP)
+
+    result = run(["osacompile", "-o", str(NOTIFIER_APP), str(src)], timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(f"osacompile failed: {result.stderr.strip() or result.stdout.strip()}")
+
+    # Render the icon (best-effort).
+    if icon_svg.exists() and command_exists("rsvg-convert") and command_exists("iconutil"):
+        with tempfile.TemporaryDirectory() as tmp:
+            iconset = Path(tmp) / "icon.iconset"
+            iconset.mkdir()
+            for size in (16, 32, 128, 256, 512):
+                for scale, suffix in ((1, f"{size}x{size}"), (2, f"{size}x{size}@2x")):
+                    px = str(size * scale)
+                    run(["rsvg-convert", "-w", px, "-h", px, str(icon_svg),
+                         "-o", str(iconset / f"icon_{suffix}.png")], timeout=30)
+            icns = Path(tmp) / "AppIcon.icns"
+            if run(["iconutil", "-c", "icns", str(iconset), "-o", str(icns)], timeout=60).returncode == 0:
+                shutil.copyfile(icns, NOTIFIER_APP / "Contents" / "Resources" / "applet.icns")
+            else:
+                log("iconutil failed; notifier app will use the default icon")
+    else:
+        log("rsvg-convert/iconutil not available; notifier app will use the default icon")
+
+    # Stable identity + background-only (no Dock icon / focus steal).
+    plist = NOTIFIER_APP / "Contents" / "Info.plist"
+    for key, typ, value in (
+        ("CFBundleIdentifier", "string", NOTIFIER_BUNDLE_ID),
+        ("CFBundleName", "string", "Meeting Recorder"),
+        ("LSUIElement", "bool", "true"),
+    ):
+        if run(["/usr/libexec/PlistBuddy", "-c", f"Set :{key} {value}", str(plist)]).returncode != 0:
+            run(["/usr/libexec/PlistBuddy", "-c", f"Add :{key} {typ} {value}", str(plist)])
+
+    # Re-sign (bundle was modified) and register with Launch Services.
+    run(["codesign", "--force", "--deep", "-s", "-", str(NOTIFIER_APP)], timeout=60)
+    lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    if Path(lsregister).exists():
+        run([lsregister, "-f", str(NOTIFIER_APP)], timeout=30)
+    return NOTIFIER_APP
+
+
+def install_notifier_app() -> int:
+    try:
+        app = build_notifier_app()
+    except Exception as exc:
+        print(f"Could not build notifier app: {exc}")
+        return 1
+    print(f"Installed notifier app: {app}")
+    notify("Meeting Recorder", "Notifications now use the Meeting Recorder logo.")
+    print("Sent a test notification. If macOS asks, allow notifications for \"Meeting Recorder\".")
+    print("(System Settings > Notifications > Meeting Recorder to adjust.)")
+    return 0
+
+
 def install_launch_agent() -> Path:
     plist = LAUNCH_AGENT_PATH
     script = Path(__file__).resolve()
@@ -776,6 +941,10 @@ def launch_service() -> str:
 
 
 def start_launch_agent() -> int:
+    try:
+        build_notifier_app()
+    except Exception as exc:
+        log(f"could not build notifier app ({exc}); notifications will use the default icon")
     plist = install_launch_agent()
     subprocess.run(["launchctl", "bootout", launch_domain(), str(plist)], capture_output=True)
     proc = subprocess.run(["launchctl", "bootstrap", launch_domain(), str(plist)], text=True, capture_output=True)
@@ -825,6 +994,7 @@ def main() -> int:
     tr = sub.add_parser("transcribe", help="transcribe an existing audio file")
     tr.add_argument("audio")
     sub.add_parser("install-launch-agent", help="write the LaunchAgent plist")
+    sub.add_parser("install-app", help="build the branded notifier app (logo for notifications)")
     sub.add_parser("start", help="install and start the login background watcher")
     sub.add_parser("stop", help="stop the login background watcher")
     sub.add_parser("status", help="show whether the login background watcher is running")
@@ -849,6 +1019,8 @@ def main() -> int:
     if args.command == "install-launch-agent":
         print(install_launch_agent())
         return 0
+    if args.command == "install-app":
+        return install_notifier_app()
     if args.command == "start":
         return start_launch_agent()
     if args.command == "stop":

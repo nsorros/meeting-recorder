@@ -19,6 +19,7 @@ Local macOS meeting recorder:
 ~/code/meeting-recorder/mrec record-start menubar-manual
 ~/code/meeting-recorder/mrec record-stop
 ~/code/meeting-recorder/mrec transcribe ~/Meetings/Recordings/example.m4a
+~/code/meeting-recorder/mrec install-app
 ```
 
 Recordings and transcripts are written under:
@@ -74,6 +75,47 @@ Choose a Claude model:
 ```sh
 export MEETING_RECORDER_CLAUDE_MODEL=sonnet
 ```
+
+## Speaker Labels
+
+The cleanup pass attributes each turn to a speaker and adds a **Speakers legend**
+at the top of the notes. With no acoustic diarization it infers speakers from
+turn-taking and content — using real names when they are clearly identifiable and
+consistent role labels (`Speaker 1 (host)`, `Speaker 2 (client)`) otherwise. This
+is a best-supported reading, not ground truth.
+
+For true per-person acoustic diarization (like Google Meet / Gemini), enable the
+optional [whisperx](https://github.com/m-bain/whisperX) path:
+
+```sh
+pipx install whisperx            # or: pip install whisperx
+export HF_TOKEN=hf_...            # Hugging Face token
+# Accept the model licenses once at:
+#   huggingface.co/pyannote/speaker-diarization-3.1
+#   huggingface.co/pyannote/segmentation-3.0
+export MEETING_RECORDER_DIARIZE=1
+```
+
+When enabled and available, whisperx produces a speaker-tagged transcript
+(`[SPEAKER_00]` …) that is fed to the cleanup instead of the plain one. If
+whisperx or the token is missing, the tool logs why and falls back to the plain
+transcript — it never fails the run.
+
+## Notification Logo
+
+Notifications are posted through a small `~/Applications/Meeting Recorder.app` so
+they carry the Meeting Recorder logo instead of the generic script icon. Build or
+refresh it with:
+
+```sh
+~/code/meeting-recorder/mrec install-app
+```
+
+`mrec start` also builds it automatically. The first time a notification fires,
+macOS may ask you to allow notifications for "Meeting Recorder" (System Settings >
+Notifications). Building the icon uses `rsvg-convert` and `iconutil`; if
+`rsvg-convert` is missing the app still works, just with the default icon. Edit
+`assets/icon.svg` and rerun `mrec install-app` to change the logo.
 
 ## Background Agent
 
@@ -143,6 +185,7 @@ Environment variables:
 - `MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD`: seconds — skip silent stretches longer than this when a hallucination is detected (needs word timestamps, which the tool enables automatically). Default: `2`. Set to empty to disable.
 - `MEETING_RECORDER_DISABLE_CLAUDE`: set to `1` to skip Claude cleanup.
 - `MEETING_RECORDER_CLAUDE_MODEL`: optional Claude model alias.
+- `MEETING_RECORDER_DIARIZE`: set to `1` to enable acoustic speaker diarization via whisperx (needs whisperx + `HF_TOKEN`). See **Speaker Labels**.
 - `MEETING_RECORDER_POLL_SECONDS`: meeting detection interval. Default: `10`.
 - `MEETING_RECORDER_END_GRACE_SECONDS`: time to wait after meeting disappears before stopping. Default: `45`.
 - `MEETING_RECORDER_CHECK_IN_SECONDS`: while recording, ask whether to keep going after this many seconds. Default: `1800` (30 minutes). Set to `0` to disable. Dismissing or ignoring this prompt now **keeps recording** — only clicking "Stop and transcribe" stops it, so an unanswered check-in can no longer cut a meeting short.
