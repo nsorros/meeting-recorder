@@ -28,11 +28,31 @@ LAUNCH_AGENT_PATH = Path(f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist").e
 STATE_DIR = Path(os.environ.get("MEETING_RECORDER_STATE_DIR", "~/.local/state/meeting-recorder")).expanduser()
 MANUAL_PID_FILE = STATE_DIR / "manual-recording.pid"
 AUDIO_DEVICE = os.environ.get("MEETING_RECORDER_AUDIO_DEVICE", "").strip()
+# Capture sample rate for the output WAV. The bare built-in mic sometimes gets
+# negotiated down to 24 kHz with dropouts; pinning the output rate keeps files
+# consistent. Default 48 kHz (native for most devices and loopbacks).
+SAMPLE_RATE = os.environ.get("MEETING_RECORDER_SAMPLE_RATE", "48000").strip()
+# Substrings that identify a loopback/aggregate device able to capture the
+# meeting audio (both sides), as opposed to a bare microphone that only hears
+# the local speaker. Used to auto-pick a device and to warn in doctor.
+LOOPBACK_HINTS = ("blackhole", "aggregate", "loopback", "soundflower", "vb-cable", "vb-audio", "multi-output", "existential")
+# Set to 1/true to silence the "recording microphone only" warning.
+ALLOW_MIC_ONLY = os.environ.get("MEETING_RECORDER_ALLOW_MIC_ONLY", "").lower() in {"1", "true", "yes"}
 POLL_SECONDS = int(os.environ.get("MEETING_RECORDER_POLL_SECONDS", "10"))
 END_GRACE_SECONDS = int(os.environ.get("MEETING_RECORDER_END_GRACE_SECONDS", "45"))
 CHECK_IN_SECONDS = int(os.environ.get("MEETING_RECORDER_CHECK_IN_SECONDS", "1800"))
 WHISPER_MODEL = os.environ.get("MEETING_RECORDER_WHISPER_MODEL", "turbo")
 LANGUAGE = os.environ.get("MEETING_RECORDER_LANGUAGE", "")
+# Anti-hallucination settings. Meeting audio is often ~half silence (one party
+# listening, screen-share pauses), and vanilla Whisper fills those gaps with
+# repeated priors like "Thank you" / ".". These defaults suppress that:
+#  - condition_on_previous_text False breaks the repeat-the-last-line feedback loop
+#  - word_timestamps True enables hallucination_silence_threshold
+#  - hallucination_silence_threshold skips silent stretches (seconds) where a
+#    hallucination is detected. Set it empty to disable.
+WHISPER_CONDITION_ON_PREVIOUS_TEXT = os.environ.get("MEETING_RECORDER_CONDITION_ON_PREVIOUS_TEXT", "False")
+WHISPER_NO_SPEECH_THRESHOLD = os.environ.get("MEETING_RECORDER_NO_SPEECH_THRESHOLD", "0.6")
+WHISPER_HALLUCINATION_SILENCE_THRESHOLD = os.environ.get("MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD", "2").strip()
 CLAUDE_MODEL = os.environ.get("MEETING_RECORDER_CLAUDE_MODEL", "")
 DISABLE_CLAUDE = os.environ.get("MEETING_RECORDER_DISABLE_CLAUDE", "").lower() in {"1", "true", "yes"}
 
@@ -189,21 +209,24 @@ def ask_continue_recording(reason: str, audio: Path) -> bool:
         f"Audio file:\n{display_path(audio)}\n\n"
         "Should I keep recording?"
     )
+    # No cancel button and any dialog failure defaults to KEEP recording: a
+    # dismissed or timed-out check-in must never silently end a live meeting.
+    # Only an explicit "Stop and transcribe" click stops.
     script = (
         "display dialog "
         + applescript_quote(message)
         + ' buttons {"Stop and transcribe", "Keep recording"} default button "Keep recording" '
-          'cancel button "Stop and transcribe" with title "Meeting Recorder" giving up after 60'
+          'with title "Meeting Recorder" giving up after 60'
     )
     log_section("recording check-in", reason=reason, audio_file=display_path(audio))
     try:
         out = osascript(script, timeout=70)
     except Exception as exc:
-        log(f"recording check-in failed or stop requested: {exc}")
-        return False
-    keep_going = "button returned:Keep recording" in out and "gave up:true" not in out
-    log(f"check-in response: {'keep recording' if keep_going else 'stop and transcribe'}")
-    return keep_going
+        log(f"check-in dialog dismissed ({exc}); keeping recording")
+        return True
+    stop = "button returned:Stop and transcribe" in out
+    log(f"check-in response: {'stop and transcribe' if stop else 'keep recording'}")
+    return not stop
 
 
 def active_processes() -> list[str]:
@@ -293,10 +316,47 @@ def visible_audio_devices(devices: str) -> list[str]:
     return found
 
 
-def audio_device_arg() -> str:
+_AUDIO_INDEX_RE = re.compile(r"\[(\d+)\]\s+(.+)")
+
+
+def audio_device_catalog() -> list[tuple[int, str]]:
+    """(index, name) for every AVFoundation audio input device."""
+    catalog: list[tuple[int, str]] = []
+    for line in visible_audio_devices(list_audio_devices()):
+        match = _AUDIO_INDEX_RE.search(line)
+        if match:
+            catalog.append((int(match.group(1)), match.group(2).strip()))
+    return catalog
+
+
+def is_loopback_name(name: str) -> bool:
+    low = name.lower()
+    return any(hint in low for hint in LOOPBACK_HINTS)
+
+
+def resolve_audio_device() -> tuple[str, str, bool]:
+    """Return (avfoundation_arg, human_name, is_loopback).
+
+    If MEETING_RECORDER_AUDIO_DEVICE is set it wins. Otherwise auto-pick a
+    loopback/aggregate device if one exists (so we capture the whole meeting,
+    not just the local mic); failing that, fall back to default index 0.
+    """
+    catalog = audio_device_catalog()
+    names = {idx: name for idx, name in catalog}
     if AUDIO_DEVICE:
-        return f":{AUDIO_DEVICE}"
-    return ":0"
+        if AUDIO_DEVICE.isdigit():
+            name = names.get(int(AUDIO_DEVICE), AUDIO_DEVICE)
+        else:
+            name = AUDIO_DEVICE
+        return f":{AUDIO_DEVICE}", name, is_loopback_name(name)
+    for idx, name in catalog:
+        if is_loopback_name(name):
+            return f":{idx}", name, True
+    return ":0", names.get(0, "default input (index 0)"), is_loopback_name(names.get(0, ""))
+
+
+def audio_device_arg() -> str:
+    return resolve_audio_device()[0]
 
 
 def slug(value: str) -> str:
@@ -308,6 +368,7 @@ def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
     ROOT.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     path = ROOT / f"{now}_{slug(reason)}.wav"
+    device_arg, device_name, is_loopback = resolve_audio_device()
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -318,18 +379,28 @@ def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
         "-f",
         "avfoundation",
         "-i",
-        audio_device_arg(),
+        device_arg,
         "-vn",
         "-acodec",
         "pcm_s16le",
+        "-ar",
+        SAMPLE_RATE,
         str(path),
     ]
     log_section(
         "recording started",
         meeting=reason,
         audio_file=display_path(path),
-        audio_input=audio_device_arg(),
+        audio_input=f"{device_arg} ({device_name})",
+        capture=("loopback (both sides)" if is_loopback else "microphone only"),
     )
+    if not is_loopback and not ALLOW_MIC_ONLY:
+        log(
+            f"WARNING: capturing '{device_name}', a microphone — you will get your own voice but "
+            "little of the far side. For full meeting audio, set up a BlackHole aggregate device "
+            "and MEETING_RECORDER_AUDIO_DEVICE (see README / run 'mrec doctor')."
+        )
+        notify("Meeting Recorder", "Recording mic only — the far side may be missing. Run mrec doctor to set up loopback capture.")
     log("ffmpeg command: " + shlex.join(cmd))
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3)
@@ -359,6 +430,14 @@ def transcribe_audio(audio: Path) -> Path:
     out_dir = audio.with_suffix("")
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["whisper", str(audio), "--model", WHISPER_MODEL, "--output_dir", str(out_dir), "--output_format", "all"]
+    # Suppress silence hallucinations (see WHISPER_* config above).
+    cmd.extend([
+        "--word_timestamps", "True",
+        "--condition_on_previous_text", WHISPER_CONDITION_ON_PREVIOUS_TEXT,
+        "--no_speech_threshold", WHISPER_NO_SPEECH_THRESHOLD,
+    ])
+    if WHISPER_HALLUCINATION_SILENCE_THRESHOLD:
+        cmd.extend(["--hallucination_silence_threshold", WHISPER_HALLUCINATION_SILENCE_THRESHOLD])
     if LANGUAGE:
         cmd.extend(["--language", LANGUAGE])
     log_section("transcription started", audio_file=display_path(audio), output_dir=display_path(out_dir), engine="whisper")
@@ -609,7 +688,6 @@ def doctor() -> int:
         ok = ok and exists
     print(f"recordings: {ROOT}")
     print(f"log: {LOG}")
-    print(f"audio input: {audio_device_arg()} ({'MEETING_RECORDER_AUDIO_DEVICE' if AUDIO_DEVICE else 'default index 0'})")
     print("\nAVFoundation devices:")
     devices = list_audio_devices()
     print(devices or "(none visible)")
@@ -617,8 +695,19 @@ def doctor() -> int:
     if not audio_devices:
         print("\nffmpeg cannot see audio devices. Grant microphone permission to Terminal/iTerm and rerun doctor.")
         ok = False
-    if "BlackHole" not in devices and "Loopback" not in devices and "VB-Cable" not in devices:
-        print("\nNo loopback device was obvious. For speaker + mic capture, create an Aggregate Device with BlackHole and your mic, then set MEETING_RECORDER_AUDIO_DEVICE to its AVFoundation index or name.")
+
+    device_arg, device_name, is_loopback = resolve_audio_device()
+    source = "MEETING_RECORDER_AUDIO_DEVICE" if AUDIO_DEVICE else ("auto-detected loopback" if is_loopback else "default index 0")
+    print(f"\naudio input: {device_arg} — {device_name} [{source}]")
+    print(f"sample rate: {SAMPLE_RATE} Hz")
+    if is_loopback:
+        print("capture: ✅ loopback/aggregate — records the whole meeting (both sides).")
+    else:
+        print("capture: ⚠️  MICROPHONE ONLY — you will get your own voice but little of the far side.")
+        print("         Google Meet, Zoom etc. also contend for this mic, which can drop ~half the audio.")
+        print("         Fix: install BlackHole 2ch, build an Aggregate Device (mic + BlackHole) in Audio")
+        print("         MIDI Setup, route meeting output to it, then set MEETING_RECORDER_AUDIO_DEVICE to")
+        print("         that device's name/index and run 'mrec start' again. See README > Audio Setup.")
     return 0 if ok else 1
 
 
@@ -632,6 +721,7 @@ def install_launch_agent() -> Path:
         "MEETING_RECORDER_WHISPER_MODEL": WHISPER_MODEL,
         "MEETING_RECORDER_POLL_SECONDS": str(POLL_SECONDS),
         "MEETING_RECORDER_END_GRACE_SECONDS": str(END_GRACE_SECONDS),
+        "MEETING_RECORDER_SAMPLE_RATE": SAMPLE_RATE,
     }
     if AUDIO_DEVICE:
         env_vars["MEETING_RECORDER_AUDIO_DEVICE"] = AUDIO_DEVICE
