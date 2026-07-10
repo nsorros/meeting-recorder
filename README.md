@@ -19,6 +19,7 @@ Local macOS meeting recorder:
 ~/code/meeting-recorder/mrec record-start menubar-manual
 ~/code/meeting-recorder/mrec record-stop
 ~/code/meeting-recorder/mrec transcribe ~/Meetings/Recordings/example.m4a
+~/code/meeting-recorder/mrec install-app
 ```
 
 Recordings and transcripts are written under:
@@ -74,6 +75,47 @@ Choose a Claude model:
 ```sh
 export MEETING_RECORDER_CLAUDE_MODEL=sonnet
 ```
+
+## Speaker Labels
+
+The cleanup pass attributes each turn to a speaker and adds a **Speakers legend**
+at the top of the notes. With no acoustic diarization it infers speakers from
+turn-taking and content — using real names when they are clearly identifiable and
+consistent role labels (`Speaker 1 (host)`, `Speaker 2 (client)`) otherwise. This
+is a best-supported reading, not ground truth.
+
+For true per-person acoustic diarization (like Google Meet / Gemini), enable the
+optional [whisperx](https://github.com/m-bain/whisperX) path:
+
+```sh
+pipx install whisperx            # or: pip install whisperx
+export HF_TOKEN=hf_...            # Hugging Face token
+# Accept the model licenses once at:
+#   huggingface.co/pyannote/speaker-diarization-3.1
+#   huggingface.co/pyannote/segmentation-3.0
+export MEETING_RECORDER_DIARIZE=1
+```
+
+When enabled and available, whisperx produces a speaker-tagged transcript
+(`[SPEAKER_00]` …) that is fed to the cleanup instead of the plain one. If
+whisperx or the token is missing, the tool logs why and falls back to the plain
+transcript — it never fails the run.
+
+## Notification Logo
+
+Notifications are posted through a small `~/Applications/Meeting Recorder.app` so
+they carry the Meeting Recorder logo instead of the generic script icon. Build or
+refresh it with:
+
+```sh
+~/code/meeting-recorder/mrec install-app
+```
+
+`mrec start` also builds it automatically. The first time a notification fires,
+macOS may ask you to allow notifications for "Meeting Recorder" (System Settings >
+Notifications). Building the icon uses `rsvg-convert` and `iconutil`; if
+`rsvg-convert` is missing the app still works, just with the default icon. Edit
+`assets/icon.svg` and rerun `mrec install-app` to change the logo.
 
 ## Background Agent
 
@@ -131,17 +173,28 @@ Menu actions:
 
 Environment variables:
 
-- `MEETING_RECORDER_AUDIO_DEVICE`: AVFoundation audio index or name. Default: `0`.
+- `MEETING_RECORDER_AUDIO_DEVICE`: AVFoundation audio index or name. Default: auto — a loopback/aggregate device (BlackHole, Aggregate, Loopback, …) if one is present, otherwise index `0`. Prefer a **name** over an index: AVFoundation indices are not stable across reboots/device changes, so `0` can silently become a webcam mic instead of your built-in mic.
+- `MEETING_RECORDER_SAMPLE_RATE`: output WAV sample rate. Default: `48000`.
+- `MEETING_RECORDER_AUDIO_SYNC`: keep recordings at real-time length. Default: `1`. ffmpeg's avfoundation capture under-delivers samples (~12% even on a bare mic, worse under load), which time-compresses audio and drifts timestamps; this pads genuine capture gaps with silence via wall-clock timestamps + async resampling. Set to `0` to disable.
+- `MEETING_RECORDER_ALLOW_MIC_ONLY`: set to `1` to silence the warning shown when recording a plain microphone instead of a loopback device.
 - `MEETING_RECORDER_DIR`: output directory. Default: `~/Meetings/Recordings`.
 - `MEETING_RECORDER_LOG`: log path. Default: `~/Library/Logs/meeting-recorder.log`.
 - `MEETING_RECORDER_WHISPER_MODEL`: Whisper model. Default: `turbo`.
 - `MEETING_RECORDER_LANGUAGE`: optional Whisper language.
+- `MEETING_RECORDER_CONDITION_ON_PREVIOUS_TEXT`: `True`/`False`. Default: `False`. Keeping this `False` stops Whisper repeating the previous line (the "Thank you… Thank you…" loops) across silences.
+- `MEETING_RECORDER_NO_SPEECH_THRESHOLD`: probability above which a segment is treated as silence and dropped. Default: `0.6`.
+- `MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD`: seconds — skip silent stretches longer than this when a hallucination is detected (needs word timestamps, which the tool enables automatically). Default: `2`. Set to empty to disable.
 - `MEETING_RECORDER_DISABLE_CLAUDE`: set to `1` to skip Claude cleanup.
 - `MEETING_RECORDER_CLAUDE_MODEL`: optional Claude model alias.
+- `MEETING_RECORDER_DIARIZE`: set to `1` to enable acoustic speaker diarization via whisperx (needs whisperx + `HF_TOKEN`). See **Speaker Labels**.
 - `MEETING_RECORDER_POLL_SECONDS`: meeting detection interval. Default: `10`.
 - `MEETING_RECORDER_END_GRACE_SECONDS`: time to wait after meeting disappears before stopping. Default: `45`.
-- `MEETING_RECORDER_CHECK_IN_SECONDS`: while recording, ask whether to keep going after this many seconds. Default: `1800` (30 minutes). Set to `0` to disable.
+- `MEETING_RECORDER_CHECK_IN_SECONDS`: while recording, ask whether to keep going after this many seconds. Default: `1800` (30 minutes). Set to `0` to disable. Dismissing or ignoring this prompt now **keeps recording** — only clicking "Stop and transcribe" stops it, so an unanswered check-in can no longer cut a meeting short.
 
 ## Recording Reliability
 
 The tool records new meetings as `.wav` rather than `.m4a`. WAV files are larger, but they are much safer for long recordings because they remain easier to recover if the process is stopped unexpectedly. Older `.m4a` recordings without a finalized MP4 `moov` atom may not be transcribable.
+
+### Capture the whole meeting, not just your mic
+
+If `MEETING_RECORDER_AUDIO_DEVICE` points at a plain microphone (or falls back to the default), the recording captures **your side clearly and the far side barely** — the other participants only reach the mic as faint speaker bleed. Worse, a browser meeting and `ffmpeg` both holding the same built-in mic can drop a large fraction of the audio. Run `mrec doctor`: it now reports whether the selected device is a loopback (records everyone) or microphone-only (warns), and the watcher posts a notification if it starts a mic-only recording. For full coverage, follow **Audio Setup** above to create a BlackHole aggregate device and point `MEETING_RECORDER_AUDIO_DEVICE` at it by name.

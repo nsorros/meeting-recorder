@@ -13,9 +13,11 @@ import datetime as dt
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -27,14 +29,53 @@ LAUNCH_AGENT_LABEL = "com.nsorros.meeting-recorder"
 LAUNCH_AGENT_PATH = Path(f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist").expanduser()
 STATE_DIR = Path(os.environ.get("MEETING_RECORDER_STATE_DIR", "~/.local/state/meeting-recorder")).expanduser()
 MANUAL_PID_FILE = STATE_DIR / "manual-recording.pid"
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+# Notifier app: gives notifications the Meeting Recorder logo instead of the
+# generic osascript icon. Built by `mrec install-app`; notify() falls back to
+# osascript when it is not installed.
+NOTIFIER_APP = Path("~/Applications/Meeting Recorder.app").expanduser()
+NOTIFIER_BUNDLE_ID = "com.nsorros.meeting-recorder-notifier"
+NOTIFY_QUEUE = STATE_DIR / "notify-queue"
 AUDIO_DEVICE = os.environ.get("MEETING_RECORDER_AUDIO_DEVICE", "").strip()
+# Capture sample rate for the output WAV. The bare built-in mic sometimes gets
+# negotiated down to 24 kHz with dropouts; pinning the output rate keeps files
+# consistent. Default 48 kHz (native for most devices and loopbacks).
+SAMPLE_RATE = os.environ.get("MEETING_RECORDER_SAMPLE_RATE", "48000").strip()
+# Substrings that identify a loopback/aggregate device able to capture the
+# meeting audio (both sides), as opposed to a bare microphone that only hears
+# the local speaker. Used to auto-pick a device and to warn in doctor.
+LOOPBACK_HINTS = ("blackhole", "aggregate", "loopback", "soundflower", "vb-cable", "vb-audio", "multi-output", "existential")
+# ffmpeg's avfoundation capture under-delivers samples (~12% even on a bare mic,
+# worse under load), which time-compresses audio and drifts timestamps. Wall-clock
+# input timestamps + async resampling pad genuine capture gaps with silence so the
+# recording keeps real-time length and honest timing. Set to 0 to disable.
+AUDIO_SYNC = os.environ.get("MEETING_RECORDER_AUDIO_SYNC", "1").lower() not in {"0", "false", "no"}
+# Set to 1/true to silence the "recording microphone only" warning.
+ALLOW_MIC_ONLY = os.environ.get("MEETING_RECORDER_ALLOW_MIC_ONLY", "").lower() in {"1", "true", "yes"}
 POLL_SECONDS = int(os.environ.get("MEETING_RECORDER_POLL_SECONDS", "10"))
 END_GRACE_SECONDS = int(os.environ.get("MEETING_RECORDER_END_GRACE_SECONDS", "45"))
 CHECK_IN_SECONDS = int(os.environ.get("MEETING_RECORDER_CHECK_IN_SECONDS", "1800"))
 WHISPER_MODEL = os.environ.get("MEETING_RECORDER_WHISPER_MODEL", "turbo")
 LANGUAGE = os.environ.get("MEETING_RECORDER_LANGUAGE", "")
+# Anti-hallucination settings. Meeting audio is often ~half silence (one party
+# listening, screen-share pauses), and vanilla Whisper fills those gaps with
+# repeated priors like "Thank you" / ".". These defaults suppress that:
+#  - condition_on_previous_text False breaks the repeat-the-last-line feedback loop
+#  - word_timestamps True enables hallucination_silence_threshold
+#  - hallucination_silence_threshold skips silent stretches (seconds) where a
+#    hallucination is detected. Set it empty to disable.
+WHISPER_CONDITION_ON_PREVIOUS_TEXT = os.environ.get("MEETING_RECORDER_CONDITION_ON_PREVIOUS_TEXT", "False")
+WHISPER_NO_SPEECH_THRESHOLD = os.environ.get("MEETING_RECORDER_NO_SPEECH_THRESHOLD", "0.6")
+WHISPER_HALLUCINATION_SILENCE_THRESHOLD = os.environ.get("MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD", "2").strip()
 CLAUDE_MODEL = os.environ.get("MEETING_RECORDER_CLAUDE_MODEL", "")
 DISABLE_CLAUDE = os.environ.get("MEETING_RECORDER_DISABLE_CLAUDE", "").lower() in {"1", "true", "yes"}
+# Speaker labels. The Claude cleanup always attributes turns to speakers from
+# context (names if mentioned, else consistent role labels). For true acoustic
+# per-person diarization, set MEETING_RECORDER_DIARIZE=1 with whisperx installed
+# and a Hugging Face token (see README > Speaker Labels); when that succeeds its
+# speaker-tagged transcript is fed to the cleanup instead of the plain one.
+DIARIZE = os.environ.get("MEETING_RECORDER_DIARIZE", "").lower() in {"1", "true", "yes"}
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
 
 BROWSER_APPS = {
     "Google Chrome": "chrome",
@@ -135,6 +176,17 @@ def osascript(script: str, timeout: int = 20) -> str:
 
 
 def notify(title: str, text: str) -> None:
+    # Prefer the branded notifier app (shows the Meeting Recorder logo). It
+    # drains a queue directory, so we drop a "<title>\n<body>" file and open it.
+    if NOTIFIER_APP.exists():
+        try:
+            NOTIFY_QUEUE.mkdir(parents=True, exist_ok=True)
+            fname = f"{time.time_ns()}-{os.getpid()}.notify"
+            (NOTIFY_QUEUE / fname).write_text(f"{title}\n{text}", encoding="utf-8")
+            subprocess.run(["open", "-a", str(NOTIFIER_APP)], capture_output=True, timeout=10)
+            return
+        except Exception as exc:
+            log(f"notifier app failed ({exc}); falling back to osascript")
     try:
         osascript(f'display notification {applescript_quote(text)} with title {applescript_quote(title)}')
     except Exception as exc:
@@ -189,21 +241,24 @@ def ask_continue_recording(reason: str, audio: Path) -> bool:
         f"Audio file:\n{display_path(audio)}\n\n"
         "Should I keep recording?"
     )
+    # No cancel button and any dialog failure defaults to KEEP recording: a
+    # dismissed or timed-out check-in must never silently end a live meeting.
+    # Only an explicit "Stop and transcribe" click stops.
     script = (
         "display dialog "
         + applescript_quote(message)
         + ' buttons {"Stop and transcribe", "Keep recording"} default button "Keep recording" '
-          'cancel button "Stop and transcribe" with title "Meeting Recorder" giving up after 60'
+          'with title "Meeting Recorder" giving up after 60'
     )
     log_section("recording check-in", reason=reason, audio_file=display_path(audio))
     try:
         out = osascript(script, timeout=70)
     except Exception as exc:
-        log(f"recording check-in failed or stop requested: {exc}")
-        return False
-    keep_going = "button returned:Keep recording" in out and "gave up:true" not in out
-    log(f"check-in response: {'keep recording' if keep_going else 'stop and transcribe'}")
-    return keep_going
+        log(f"check-in dialog dismissed ({exc}); keeping recording")
+        return True
+    stop = "button returned:Stop and transcribe" in out
+    log(f"check-in response: {'stop and transcribe' if stop else 'keep recording'}")
+    return not stop
 
 
 def active_processes() -> list[str]:
@@ -293,10 +348,47 @@ def visible_audio_devices(devices: str) -> list[str]:
     return found
 
 
-def audio_device_arg() -> str:
+_AUDIO_INDEX_RE = re.compile(r"\[(\d+)\]\s+(.+)")
+
+
+def audio_device_catalog() -> list[tuple[int, str]]:
+    """(index, name) for every AVFoundation audio input device."""
+    catalog: list[tuple[int, str]] = []
+    for line in visible_audio_devices(list_audio_devices()):
+        match = _AUDIO_INDEX_RE.search(line)
+        if match:
+            catalog.append((int(match.group(1)), match.group(2).strip()))
+    return catalog
+
+
+def is_loopback_name(name: str) -> bool:
+    low = name.lower()
+    return any(hint in low for hint in LOOPBACK_HINTS)
+
+
+def resolve_audio_device() -> tuple[str, str, bool]:
+    """Return (avfoundation_arg, human_name, is_loopback).
+
+    If MEETING_RECORDER_AUDIO_DEVICE is set it wins. Otherwise auto-pick a
+    loopback/aggregate device if one exists (so we capture the whole meeting,
+    not just the local mic); failing that, fall back to default index 0.
+    """
+    catalog = audio_device_catalog()
+    names = {idx: name for idx, name in catalog}
     if AUDIO_DEVICE:
-        return f":{AUDIO_DEVICE}"
-    return ":0"
+        if AUDIO_DEVICE.isdigit():
+            name = names.get(int(AUDIO_DEVICE), AUDIO_DEVICE)
+        else:
+            name = AUDIO_DEVICE
+        return f":{AUDIO_DEVICE}", name, is_loopback_name(name)
+    for idx, name in catalog:
+        if is_loopback_name(name):
+            return f":{idx}", name, True
+    return ":0", names.get(0, "default input (index 0)"), is_loopback_name(names.get(0, ""))
+
+
+def audio_device_arg() -> str:
+    return resolve_audio_device()[0]
 
 
 def slug(value: str) -> str:
@@ -308,28 +400,28 @@ def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
     ROOT.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     path = ROOT / f"{now}_{slug(reason)}.wav"
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-nostats",
-        "-loglevel",
-        "error",
-        "-y",
-        "-f",
-        "avfoundation",
-        "-i",
-        audio_device_arg(),
-        "-vn",
-        "-acodec",
-        "pcm_s16le",
-        str(path),
-    ]
+    device_arg, device_name, is_loopback = resolve_audio_device()
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y"]
+    if AUDIO_SYNC:
+        cmd += ["-use_wallclock_as_timestamps", "1"]
+    cmd += ["-f", "avfoundation", "-i", device_arg, "-vn"]
+    if AUDIO_SYNC:
+        cmd += ["-af", "aresample=async=1:first_pts=0"]
+    cmd += ["-acodec", "pcm_s16le", "-ar", SAMPLE_RATE, str(path)]
     log_section(
         "recording started",
         meeting=reason,
         audio_file=display_path(path),
-        audio_input=audio_device_arg(),
+        audio_input=f"{device_arg} ({device_name})",
+        capture=("loopback (both sides)" if is_loopback else "microphone only"),
     )
+    if not is_loopback and not ALLOW_MIC_ONLY:
+        log(
+            f"WARNING: capturing '{device_name}', a microphone — you will get your own voice but "
+            "little of the far side. For full meeting audio, set up a BlackHole aggregate device "
+            "and MEETING_RECORDER_AUDIO_DEVICE (see README / run 'mrec doctor')."
+        )
+        notify("Meeting Recorder", "Recording mic only — the far side may be missing. Run mrec doctor to set up loopback capture.")
     log("ffmpeg command: " + shlex.join(cmd))
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3)
@@ -359,6 +451,14 @@ def transcribe_audio(audio: Path) -> Path:
     out_dir = audio.with_suffix("")
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["whisper", str(audio), "--model", WHISPER_MODEL, "--output_dir", str(out_dir), "--output_format", "all"]
+    # Suppress silence hallucinations (see WHISPER_* config above).
+    cmd.extend([
+        "--word_timestamps", "True",
+        "--condition_on_previous_text", WHISPER_CONDITION_ON_PREVIOUS_TEXT,
+        "--no_speech_threshold", WHISPER_NO_SPEECH_THRESHOLD,
+    ])
+    if WHISPER_HALLUCINATION_SILENCE_THRESHOLD:
+        cmd.extend(["--hallucination_silence_threshold", WHISPER_HALLUCINATION_SILENCE_THRESHOLD])
     if LANGUAGE:
         cmd.extend(["--language", LANGUAGE])
     log_section("transcription started", audio_file=display_path(audio), output_dir=display_path(out_dir), engine="whisper")
@@ -375,14 +475,61 @@ def transcribe_audio(audio: Path) -> Path:
             raise RuntimeError(f"whisper produced no txt output in {out_dir}")
         raw_txt = candidates[0]
 
+    diarized_txt = diarize_with_whisperx(audio, out_dir) if DIARIZE else None
+
     final_md = out_dir / f"{audio.stem}.meeting.md"
     if DISABLE_CLAUDE:
         log("claude cleanup disabled; writing basic markdown transcript")
-        write_basic_meeting_md(raw_txt, final_md, audio)
+        write_basic_meeting_md(diarized_txt or raw_txt, final_md, audio)
     else:
-        clean_with_claude(raw_txt, final_md, audio)
+        clean_with_claude(raw_txt, final_md, audio, diarized_txt=diarized_txt)
     log_section("transcription finished", final_notes=display_path(final_md), raw_transcript=display_path(raw_txt))
     return final_md
+
+
+def diarize_with_whisperx(audio: Path, out_dir: Path) -> Path | None:
+    """Optional true acoustic diarization via the whisperx CLI.
+
+    Returns a path to a transcript whose lines are prefixed with speaker tags
+    (e.g. ``[SPEAKER_00]``), or None if whisperx is unavailable, no HF token is
+    set, or the run fails. Never raises — diarization is best-effort and the
+    plain Whisper transcript remains the fallback.
+    """
+    if not command_exists("whisperx"):
+        log("diarization requested but whisperx is not installed; using plain transcript (see README > Speaker Labels)")
+        return None
+    if not HF_TOKEN:
+        log("diarization requested but no Hugging Face token (HF_TOKEN) is set; using plain transcript")
+        return None
+    dia_dir = out_dir / "diarization"
+    dia_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "whisperx", str(audio),
+        "--model", WHISPER_MODEL,
+        "--diarize",
+        "--hf_token", HF_TOKEN,
+        "--output_dir", str(dia_dir),
+        "--output_format", "txt",
+    ]
+    if LANGUAGE:
+        cmd.extend(["--language", LANGUAGE])
+    log_section("diarization started", audio_file=display_path(audio), engine="whisperx")
+    log("whisperx command: " + shlex.join(c if c != HF_TOKEN else "<hf_token>" for c in cmd))
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60 * 60)
+    except Exception as exc:
+        log(f"diarization failed to run ({exc}); using plain transcript")
+        return None
+    (dia_dir / "whisperx.log").write_text(proc.stdout + "\n" + proc.stderr, encoding="utf-8")
+    if proc.returncode != 0:
+        log(f"whisperx exited {proc.returncode}; using plain transcript (see {display_path(dia_dir / 'whisperx.log')})")
+        return None
+    candidates = sorted(dia_dir.glob("*.txt"))
+    if not candidates:
+        log("whisperx produced no txt output; using plain transcript")
+        return None
+    log(f"diarization succeeded: {display_path(candidates[0])}")
+    return candidates[0]
 
 
 def write_basic_meeting_md(raw_txt: Path, final_md: Path, audio: Path) -> None:
@@ -393,25 +540,47 @@ def write_basic_meeting_md(raw_txt: Path, final_md: Path, audio: Path) -> None:
     )
 
 
-def clean_with_claude(raw_txt: Path, final_md: Path, audio: Path) -> None:
+def clean_with_claude(raw_txt: Path, final_md: Path, audio: Path, diarized_txt: Path | None = None) -> None:
+    transcript_text = raw_txt.read_text(encoding="utf-8", errors="replace")
+    if diarized_txt is not None:
+        speaker_note = (
+            "The transcript below already carries acoustic speaker tags (e.g. [SPEAKER_00]) "
+            "from diarization. Keep those turn boundaries. Map each tag to a real name if the "
+            "content makes it unambiguous (e.g. someone is addressed by name or introduces "
+            "themselves); otherwise keep a stable label like \"Speaker 1 (host)\". State the mapping "
+            "in a short Speakers legend at the top."
+        )
+        transcript_text = diarized_txt.read_text(encoding="utf-8", errors="replace")
+    else:
+        speaker_note = (
+            "Attribute each turn to a speaker. The transcript has no speaker tags, so infer them "
+            "from turn-taking and content: use a person's real name when it is clearly identifiable "
+            "(mentioned, introduced, or addressed), otherwise a consistent role label like "
+            "\"Speaker 1 (host/presenter)\" or \"Speaker 2 (client)\". Do NOT guess specific names "
+            "without support. Add a short Speakers legend at the top listing who each label is."
+        )
     prompt = f"""
 You are cleaning a machine-generated transcript of a meeting.
 
 Input audio path: {audio}
 Raw transcript path: {raw_txt}
 
+Speaker labels: {speaker_note}
+
 Produce markdown with:
 - Title inferred from content if possible
 - Date/time from the filename if useful
-- Cleaned transcript, preserving meaning and uncertainty
+- Speakers legend (label -> who they are, as far as identifiable)
+- Cleaned transcript as attributed turns in the form "**Name:** text", preserving meaning and uncertainty
 - Decisions
 - Action items with owner if identifiable
 - Open questions
 
-Do not invent details not supported by the raw transcript.
+Do not invent details not supported by the raw transcript. Attribution should be
+your best supported reading; flag it as uncertain rather than fabricating names.
 
 Raw transcript:
-{raw_txt.read_text(encoding="utf-8", errors="replace")}
+{transcript_text}
 """.strip()
     cmd = ["claude", "-p"]
     if CLAUDE_MODEL:
@@ -609,7 +778,6 @@ def doctor() -> int:
         ok = ok and exists
     print(f"recordings: {ROOT}")
     print(f"log: {LOG}")
-    print(f"audio input: {audio_device_arg()} ({'MEETING_RECORDER_AUDIO_DEVICE' if AUDIO_DEVICE else 'default index 0'})")
     print("\nAVFoundation devices:")
     devices = list_audio_devices()
     print(devices or "(none visible)")
@@ -617,9 +785,89 @@ def doctor() -> int:
     if not audio_devices:
         print("\nffmpeg cannot see audio devices. Grant microphone permission to Terminal/iTerm and rerun doctor.")
         ok = False
-    if "BlackHole" not in devices and "Loopback" not in devices and "VB-Cable" not in devices:
-        print("\nNo loopback device was obvious. For speaker + mic capture, create an Aggregate Device with BlackHole and your mic, then set MEETING_RECORDER_AUDIO_DEVICE to its AVFoundation index or name.")
+
+    device_arg, device_name, is_loopback = resolve_audio_device()
+    source = "MEETING_RECORDER_AUDIO_DEVICE" if AUDIO_DEVICE else ("auto-detected loopback" if is_loopback else "default index 0")
+    print(f"\naudio input: {device_arg} — {device_name} [{source}]")
+    print(f"sample rate: {SAMPLE_RATE} Hz")
+    if is_loopback:
+        print("capture: ✅ loopback/aggregate — records the whole meeting (both sides).")
+    else:
+        print("capture: ⚠️  MICROPHONE ONLY — you will get your own voice but little of the far side.")
+        print("         Google Meet, Zoom etc. also contend for this mic, which can drop ~half the audio.")
+        print("         Fix: install BlackHole 2ch, build an Aggregate Device (mic + BlackHole) in Audio")
+        print("         MIDI Setup, route meeting output to it, then set MEETING_RECORDER_AUDIO_DEVICE to")
+        print("         that device's name/index and run 'mrec start' again. See README > Audio Setup.")
     return 0 if ok else 1
+
+
+def build_notifier_app() -> Path:
+    """Build/refresh the branded notifier app in ~/Applications.
+
+    Compiles the AppleScript applet (assets/notify.applescript), gives it the
+    microphone icon rendered from assets/icon.svg, sets a stable bundle id, and
+    registers it with Launch Services. Best-effort: if rsvg-convert/iconutil are
+    missing the app is still built, just with the default applet icon.
+    """
+    src = ASSETS_DIR / "notify.applescript"
+    icon_svg = ASSETS_DIR / "icon.svg"
+    if not src.exists():
+        raise RuntimeError(f"missing applet source: {src}")
+    NOTIFIER_APP.parent.mkdir(parents=True, exist_ok=True)
+    if NOTIFIER_APP.exists():
+        shutil.rmtree(NOTIFIER_APP)
+
+    result = run(["osacompile", "-o", str(NOTIFIER_APP), str(src)], timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(f"osacompile failed: {result.stderr.strip() or result.stdout.strip()}")
+
+    # Render the icon (best-effort).
+    if icon_svg.exists() and command_exists("rsvg-convert") and command_exists("iconutil"):
+        with tempfile.TemporaryDirectory() as tmp:
+            iconset = Path(tmp) / "icon.iconset"
+            iconset.mkdir()
+            for size in (16, 32, 128, 256, 512):
+                for scale, suffix in ((1, f"{size}x{size}"), (2, f"{size}x{size}@2x")):
+                    px = str(size * scale)
+                    run(["rsvg-convert", "-w", px, "-h", px, str(icon_svg),
+                         "-o", str(iconset / f"icon_{suffix}.png")], timeout=30)
+            icns = Path(tmp) / "AppIcon.icns"
+            if run(["iconutil", "-c", "icns", str(iconset), "-o", str(icns)], timeout=60).returncode == 0:
+                shutil.copyfile(icns, NOTIFIER_APP / "Contents" / "Resources" / "applet.icns")
+            else:
+                log("iconutil failed; notifier app will use the default icon")
+    else:
+        log("rsvg-convert/iconutil not available; notifier app will use the default icon")
+
+    # Stable identity + background-only (no Dock icon / focus steal).
+    plist = NOTIFIER_APP / "Contents" / "Info.plist"
+    for key, typ, value in (
+        ("CFBundleIdentifier", "string", NOTIFIER_BUNDLE_ID),
+        ("CFBundleName", "string", "Meeting Recorder"),
+        ("LSUIElement", "bool", "true"),
+    ):
+        if run(["/usr/libexec/PlistBuddy", "-c", f"Set :{key} {value}", str(plist)]).returncode != 0:
+            run(["/usr/libexec/PlistBuddy", "-c", f"Add :{key} {typ} {value}", str(plist)])
+
+    # Re-sign (bundle was modified) and register with Launch Services.
+    run(["codesign", "--force", "--deep", "-s", "-", str(NOTIFIER_APP)], timeout=60)
+    lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    if Path(lsregister).exists():
+        run([lsregister, "-f", str(NOTIFIER_APP)], timeout=30)
+    return NOTIFIER_APP
+
+
+def install_notifier_app() -> int:
+    try:
+        app = build_notifier_app()
+    except Exception as exc:
+        print(f"Could not build notifier app: {exc}")
+        return 1
+    print(f"Installed notifier app: {app}")
+    notify("Meeting Recorder", "Notifications now use the Meeting Recorder logo.")
+    print("Sent a test notification. If macOS asks, allow notifications for \"Meeting Recorder\".")
+    print("(System Settings > Notifications > Meeting Recorder to adjust.)")
+    return 0
 
 
 def install_launch_agent() -> Path:
@@ -632,6 +880,8 @@ def install_launch_agent() -> Path:
         "MEETING_RECORDER_WHISPER_MODEL": WHISPER_MODEL,
         "MEETING_RECORDER_POLL_SECONDS": str(POLL_SECONDS),
         "MEETING_RECORDER_END_GRACE_SECONDS": str(END_GRACE_SECONDS),
+        "MEETING_RECORDER_SAMPLE_RATE": SAMPLE_RATE,
+        "MEETING_RECORDER_AUDIO_SYNC": "1" if AUDIO_SYNC else "0",
     }
     if AUDIO_DEVICE:
         env_vars["MEETING_RECORDER_AUDIO_DEVICE"] = AUDIO_DEVICE
@@ -686,6 +936,10 @@ def launch_service() -> str:
 
 
 def start_launch_agent() -> int:
+    try:
+        build_notifier_app()
+    except Exception as exc:
+        log(f"could not build notifier app ({exc}); notifications will use the default icon")
     plist = install_launch_agent()
     subprocess.run(["launchctl", "bootout", launch_domain(), str(plist)], capture_output=True)
     proc = subprocess.run(["launchctl", "bootstrap", launch_domain(), str(plist)], text=True, capture_output=True)
@@ -735,6 +989,7 @@ def main() -> int:
     tr = sub.add_parser("transcribe", help="transcribe an existing audio file")
     tr.add_argument("audio")
     sub.add_parser("install-launch-agent", help="write the LaunchAgent plist")
+    sub.add_parser("install-app", help="build the branded notifier app (logo for notifications)")
     sub.add_parser("start", help="install and start the login background watcher")
     sub.add_parser("stop", help="stop the login background watcher")
     sub.add_parser("status", help="show whether the login background watcher is running")
@@ -759,6 +1014,8 @@ def main() -> int:
     if args.command == "install-launch-agent":
         print(install_launch_agent())
         return 0
+    if args.command == "install-app":
+        return install_notifier_app()
     if args.command == "start":
         return start_launch_agent()
     if args.command == "stop":
