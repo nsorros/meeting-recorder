@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -17,6 +18,7 @@ MREC = HOME / "code/meeting-recorder/mrec"
 RECORDINGS = HOME / "Meetings/Recordings"
 LOG = HOME / "Library/Logs/meeting-recorder.log"
 PID_FILE = HOME / ".local/state/meeting-recorder/manual-recording.pid"
+STATUS_FILE = HOME / ".local/state/meeting-recorder/watcher-status"
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -53,8 +55,40 @@ def watcher_running() -> bool:
     return proc.returncode == 0 and "running" in proc.stdout
 
 
-def menu_title(text: str, sfimage: str) -> None:
-    print(f"{text} | sfimage={sfimage}")
+def watcher_status() -> dict[str, str]:
+    """Live watcher state (status/meeting/since), or {} if absent or stale."""
+    if not STATUS_FILE.exists():
+        return {}
+    state: dict[str, str] = {}
+    for line in STATUS_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            state[key] = value
+    try:
+        if not pid_running(int(state.get("pid", ""))):
+            return {}
+    except ValueError:
+        pass
+    return state
+
+
+def elapsed(since: str) -> str:
+    try:
+        secs = int(time.time()) - int(since)
+    except ValueError:
+        return ""
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def menu_title(text: str, sfimage: str, color: str | None = None) -> None:
+    line = f"{text} | sfimage={sfimage}"
+    if color:
+        line += f" sfcolor={color}"
+    print(line)
 
 
 def item(title: str, command: str, *params: str, refresh: bool = True, terminal: bool = False) -> None:
@@ -69,15 +103,29 @@ def item(title: str, command: str, *params: str, refresh: bool = True, terminal:
 def main() -> None:
     manual = manual_state()
     watcher = watcher_running()
+    status = watcher_status() if watcher else {}
+    state = status.get("status", "")
 
-    if manual:
-        menu_title("REC", "record.circle.fill")
+    # Menu bar title signals the current state at a glance.
+    if manual or state == "recording":
+        since = manual.get("started_at", "") if manual else status.get("since", "")
+        mins = elapsed(since)
+        menu_title(f"Rec {mins}".strip(), "record.circle.fill", color="red")
+    elif state == "transcribing":
+        menu_title("Transcribing…", "ellipsis.circle")
     elif watcher:
-        menu_title("MR", "waveform")
+        menu_title("Listening", "ear")
     else:
-        menu_title("MR", "waveform")
+        menu_title("Off", "waveform.slash")
 
     print("---")
+    if manual or state == "recording":
+        meeting = manual.get("label", "manual recording") if manual else status.get("meeting", "meeting")
+        print(f"🔴 Recording: {meeting}")
+    elif state == "transcribing":
+        print("⏳ Transcribing last meeting…")
+    elif watcher:
+        print("👂 Listening for meetings")
     print(f"Watcher: {'running' if watcher else 'stopped'}")
     if watcher:
         item("Stop watcher", str(MREC), "stop")
