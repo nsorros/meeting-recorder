@@ -104,21 +104,25 @@ transcript — it never fails the run.
 ## Notification Logo
 
 macOS locks `osascript` notifications to the generic script icon, so to show the
-Meeting Recorder mic logo the tool routes notifications through
-[terminal-notifier](https://github.com/julienXX/terminal-notifier) (a notarized
-helper) with `-appIcon`, when it is installed at
-`~/Applications/terminal-notifier.app`. Set it up with:
+Meeting Recorder mic logo the tool builds a tiny native notifier app
+(`notifier/main.swift`) that posts via the modern `UserNotifications` framework —
+so the notification carries *its* bundle icon (the mic). Build it with:
 
 ```sh
 ~/code/meeting-recorder/mrec install-app
 ```
 
-The first time, allow it once in **System Settings > Notifications >
-terminal-notifier > Allow Notifications** — otherwise macOS silently drops the
-notifications. If terminal-notifier is absent, notifications fall back to
-`osascript` (reliable, generic icon). Set `MEETING_RECORDER_NO_LOGO=1` to force
-the osascript path. Edit `assets/icon.svg`, rerun `mrec install-app` to refresh
-the logo.
+This compiles and ad-hoc-signs `~/Applications/Meeting Recorder Notifier.app`
+(needs the Xcode command line tools — `xcode-select --install`; no Apple
+Developer account required). `mrec start` builds it too. The first time, allow
+"Meeting Recorder" once in **System Settings > Notifications**. If the app can't
+be built, notifications fall back to `osascript` (reliable, generic icon); set
+`MEETING_RECORDER_NO_LOGO=1` to force that path. Edit `assets/icon.svg` and rerun
+`mrec install-app` to change the logo.
+
+> The notifier is also published standalone at
+> [github.com/nsorros/notifly](https://github.com/nsorros/notifly) — the same
+> trick for giving *any* script's notifications a custom icon.
 
 ## Background Agent
 
@@ -187,7 +191,7 @@ Environment variables:
 - `MEETING_RECORDER_CONDITION_ON_PREVIOUS_TEXT`: `True`/`False`. Default: `False`. Keeping this `False` stops Whisper repeating the previous line (the "Thank you… Thank you…" loops) across silences.
 - `MEETING_RECORDER_NO_SPEECH_THRESHOLD`: probability above which a segment is treated as silence and dropped. Default: `0.6`.
 - `MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD`: seconds — skip silent stretches longer than this when a hallucination is detected (needs word timestamps, which the tool enables automatically). Default: `2`. Set to empty to disable.
-- `MEETING_RECORDER_NO_LOGO`: set to `1` to post notifications via osascript (generic icon) instead of terminal-notifier. See **Notification Logo**.
+- `MEETING_RECORDER_NO_LOGO`: set to `1` to post notifications via osascript (generic icon) instead of the native notifier app. See **Notification Logo**.
 - `MEETING_RECORDER_DISABLE_CLAUDE`: set to `1` to skip Claude cleanup.
 - `MEETING_RECORDER_CLAUDE_MODEL`: optional Claude model alias.
 - `MEETING_RECORDER_DIARIZE`: set to `1` to enable acoustic speaker diarization via whisperx (needs whisperx + `HF_TOKEN`). See **Speaker Labels**.

@@ -13,9 +13,11 @@ import datetime as dt
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -35,10 +37,13 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 # icon, so when terminal-notifier is installed we route through it with -appIcon
 # to show the Meeting Recorder mic logo. `mrec install-app` sets this up.
 NOTIFIER_BUNDLE_ID = "com.nsorros.meeting-recorder"
-NOTIFIER_ICON = ASSETS_DIR / "icon.png"
-# terminal-notifier must be invoked via its bundle binary (a PATH symlink breaks
-# its Info.plist lookup). Set MEETING_RECORDER_NO_LOGO=1 to force plain osascript.
-TERMINAL_NOTIFIER = Path("~/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier").expanduser()
+# A tiny native Swift app (notifier/main.swift) posts notifications via the modern
+# UserNotifications framework, so they carry its bundle icon (our mic logo) on the
+# left — which osascript/terminal-notifier cannot do on current macOS. Built by
+# `mrec install-app`. Set MEETING_RECORDER_NO_LOGO=1 to force plain osascript.
+NOTIFIER_SRC = Path(__file__).resolve().parent / "notifier" / "main.swift"
+NOTIFIER_APP = Path("~/Applications/Meeting Recorder Notifier.app").expanduser()
+NOTIFIER_BIN = NOTIFIER_APP / "Contents" / "MacOS" / "notifier"
 USE_LOGO = os.environ.get("MEETING_RECORDER_NO_LOGO", "").lower() not in {"1", "true", "yes"}
 AUDIO_DEVICE = os.environ.get("MEETING_RECORDER_AUDIO_DEVICE", "").strip()
 # Capture sample rate for the output WAV. The bare built-in mic sometimes gets
@@ -201,21 +206,18 @@ def clear_watcher_status() -> None:
 
 
 def notify(title: str, text: str) -> None:
-    # terminal-notifier (if installed) is a properly registered, notarized helper
-    # that can show our logo via -appIcon. osascript always works but macOS locks
-    # it to the generic script icon. (A compiled AppleScript applet cannot: on
-    # modern macOS its notifications are silently dropped as an unregistered
-    # notification client, so we do not use one.)
-    if USE_LOGO and TERMINAL_NOTIFIER.exists():
+    # The native notifier app (built by `mrec install-app`) posts via
+    # UserNotifications so its bundle icon — our mic logo — shows on the left.
+    # osascript is the fallback: always works but locked to the generic script
+    # icon. (An AppleScript applet can't: on modern macOS its notifications are
+    # silently dropped as an unregistered client.)
+    if USE_LOGO and NOTIFIER_BIN.exists():
         try:
-            cmd = [str(TERMINAL_NOTIFIER), "-title", title, "-message", text,
-                   "-group", NOTIFIER_BUNDLE_ID]
-            if NOTIFIER_ICON.exists():
-                cmd += ["-appIcon", str(NOTIFIER_ICON)]
-            subprocess.run(cmd, capture_output=True, timeout=10)
+            subprocess.run([str(NOTIFIER_BIN), "--title", title, "--message", text],
+                           capture_output=True, timeout=10)
             return
         except Exception as exc:
-            log(f"terminal-notifier failed ({exc}); falling back to osascript")
+            log(f"native notifier failed ({exc}); falling back to osascript")
     try:
         osascript(f'display notification {applescript_quote(text)} with title {applescript_quote(title)}')
     except Exception as exc:
@@ -843,25 +845,78 @@ def doctor() -> int:
     return 0 if ok else 1
 
 
-def render_notifier_icon() -> None:
-    """Render assets/icon.png from icon.svg for terminal-notifier's -appIcon (best-effort)."""
-    svg = ASSETS_DIR / "icon.svg"
-    if svg.exists() and command_exists("rsvg-convert"):
-        run(["rsvg-convert", "-w", "512", "-h", "512", str(svg), "-o", str(NOTIFIER_ICON)], timeout=30)
+def build_notifier_app() -> Path:
+    """Compile notifier/main.swift into a signed .app whose bundle icon is the mic
+    logo, so its notifications show that logo. Ad-hoc signing only — no Apple
+    Developer account needed. Raises on failure (no swiftc, compile error, etc.)."""
+    if not NOTIFIER_SRC.exists():
+        raise RuntimeError(f"missing notifier source: {NOTIFIER_SRC}")
+    if not command_exists("xcrun"):
+        raise RuntimeError("Xcode command line tools required (xcrun not found); run: xcode-select --install")
+    icon_svg = ASSETS_DIR / "icon.svg"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        binary = tmp_path / "notifier"
+        compile_res = run(["xcrun", "swiftc", str(NOTIFIER_SRC), "-o", str(binary),
+                           "-framework", "Cocoa", "-framework", "UserNotifications"], timeout=180)
+        if compile_res.returncode != 0:
+            raise RuntimeError(f"swiftc failed: {compile_res.stderr.strip() or compile_res.stdout.strip()}")
+
+        NOTIFIER_APP.parent.mkdir(parents=True, exist_ok=True)
+        if NOTIFIER_APP.exists():
+            shutil.rmtree(NOTIFIER_APP)
+        (NOTIFIER_APP / "Contents" / "MacOS").mkdir(parents=True)
+        (NOTIFIER_APP / "Contents" / "Resources").mkdir(parents=True)
+        shutil.copyfile(binary, NOTIFIER_BIN)
+        NOTIFIER_BIN.chmod(0o755)
+
+        # Bundle icon (best-effort; the app still works without it).
+        if icon_svg.exists() and command_exists("rsvg-convert") and command_exists("iconutil"):
+            iconset = tmp_path / "icon.iconset"
+            iconset.mkdir()
+            for size in (16, 32, 128, 256, 512):
+                for scale, suffix in ((1, f"{size}x{size}"), (2, f"{size}x{size}@2x")):
+                    px = str(size * scale)
+                    run(["rsvg-convert", "-w", px, "-h", px, str(icon_svg),
+                         "-o", str(iconset / f"icon_{suffix}.png")], timeout=30)
+            icns = tmp_path / "AppIcon.icns"
+            if run(["iconutil", "-c", "icns", str(iconset), "-o", str(icns)], timeout=60).returncode == 0:
+                shutil.copyfile(icns, NOTIFIER_APP / "Contents" / "Resources" / "AppIcon.icns")
+
+        (NOTIFIER_APP / "Contents" / "Info.plist").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0"><dict>\n'
+            '  <key>CFBundleExecutable</key><string>notifier</string>\n'
+            f'  <key>CFBundleIdentifier</key><string>{NOTIFIER_BUNDLE_ID}</string>\n'
+            '  <key>CFBundleName</key><string>Meeting Recorder</string>\n'
+            '  <key>CFBundleDisplayName</key><string>Meeting Recorder</string>\n'
+            '  <key>CFBundleIconFile</key><string>AppIcon</string>\n'
+            '  <key>CFBundlePackageType</key><string>APPL</string>\n'
+            '  <key>CFBundleShortVersionString</key><string>1.0</string>\n'
+            '  <key>LSUIElement</key><true/>\n'
+            '</dict></plist>\n',
+            encoding="utf-8",
+        )
+        run(["codesign", "--force", "--deep", "-s", "-", str(NOTIFIER_APP)], timeout=60)
+        lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+        if Path(lsregister).exists():
+            run([lsregister, "-f", str(NOTIFIER_APP)], timeout=30)
+    return NOTIFIER_APP
 
 
 def install_notifier() -> int:
-    """Set up the notification logo. osascript notifications always work but show
-    the generic script icon; terminal-notifier + -appIcon shows the mic logo."""
-    render_notifier_icon()
-    if not TERMINAL_NOTIFIER.exists():
-        print("Notifications work via osascript, but show the generic script icon.")
-        print(f"To show the Meeting Recorder logo, install terminal-notifier.app at:\n  {TERMINAL_NOTIFIER.parents[2]}")
-        print("(download from github.com/julienXX/terminal-notifier/releases), then rerun 'mrec install-app'.")
-        return 0
+    """Build the native notifier app so notifications show the Meeting Recorder logo."""
+    try:
+        app = build_notifier_app()
+    except Exception as exc:
+        print(f"Could not build the notifier app: {exc}")
+        print("Notifications still work via osascript (generic icon).")
+        return 1
+    print(f"Built notifier app: {app}")
     notify("Meeting Recorder", "Logo test — notifications now use the mic icon.")
-    print("terminal-notifier found; sent a test notification with the logo.")
-    print("If nothing appears, allow it once: System Settings > Notifications > terminal-notifier > Allow.")
+    print("Sent a test notification. The first time, click Allow if macOS prompts")
+    print('(System Settings > Notifications > "Meeting Recorder").')
     return 0
 
 
@@ -932,9 +987,9 @@ def launch_service() -> str:
 
 def start_launch_agent() -> int:
     try:
-        render_notifier_icon()
+        build_notifier_app()
     except Exception as exc:
-        log(f"could not render notifier icon ({exc})")
+        log(f"could not build notifier app ({exc}); notifications will use the generic icon")
     plist = install_launch_agent()
     subprocess.run(["launchctl", "bootout", launch_domain(), str(plist)], capture_output=True)
     proc = subprocess.run(["launchctl", "bootstrap", launch_domain(), str(plist)], text=True, capture_output=True)
