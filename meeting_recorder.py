@@ -45,6 +45,11 @@ SAMPLE_RATE = os.environ.get("MEETING_RECORDER_SAMPLE_RATE", "48000").strip()
 # meeting audio (both sides), as opposed to a bare microphone that only hears
 # the local speaker. Used to auto-pick a device and to warn in doctor.
 LOOPBACK_HINTS = ("blackhole", "aggregate", "loopback", "soundflower", "vb-cable", "vb-audio", "multi-output", "existential")
+# ffmpeg's avfoundation capture under-delivers samples (~12% even on a bare mic,
+# worse under load), which time-compresses audio and drifts timestamps. Wall-clock
+# input timestamps + async resampling pad genuine capture gaps with silence so the
+# recording keeps real-time length and honest timing. Set to 0 to disable.
+AUDIO_SYNC = os.environ.get("MEETING_RECORDER_AUDIO_SYNC", "1").lower() not in {"0", "false", "no"}
 # Set to 1/true to silence the "recording microphone only" warning.
 ALLOW_MIC_ONLY = os.environ.get("MEETING_RECORDER_ALLOW_MIC_ONLY", "").lower() in {"1", "true", "yes"}
 POLL_SECONDS = int(os.environ.get("MEETING_RECORDER_POLL_SECONDS", "10"))
@@ -396,24 +401,13 @@ def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
     now = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     path = ROOT / f"{now}_{slug(reason)}.wav"
     device_arg, device_name, is_loopback = resolve_audio_device()
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-nostats",
-        "-loglevel",
-        "error",
-        "-y",
-        "-f",
-        "avfoundation",
-        "-i",
-        device_arg,
-        "-vn",
-        "-acodec",
-        "pcm_s16le",
-        "-ar",
-        SAMPLE_RATE,
-        str(path),
-    ]
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y"]
+    if AUDIO_SYNC:
+        cmd += ["-use_wallclock_as_timestamps", "1"]
+    cmd += ["-f", "avfoundation", "-i", device_arg, "-vn"]
+    if AUDIO_SYNC:
+        cmd += ["-af", "aresample=async=1:first_pts=0"]
+    cmd += ["-acodec", "pcm_s16le", "-ar", SAMPLE_RATE, str(path)]
     log_section(
         "recording started",
         meeting=reason,
@@ -887,6 +881,7 @@ def install_launch_agent() -> Path:
         "MEETING_RECORDER_POLL_SECONDS": str(POLL_SECONDS),
         "MEETING_RECORDER_END_GRACE_SECONDS": str(END_GRACE_SECONDS),
         "MEETING_RECORDER_SAMPLE_RATE": SAMPLE_RATE,
+        "MEETING_RECORDER_AUDIO_SYNC": "1" if AUDIO_SYNC else "0",
     }
     if AUDIO_DEVICE:
         env_vars["MEETING_RECORDER_AUDIO_DEVICE"] = AUDIO_DEVICE

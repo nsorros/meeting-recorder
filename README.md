@@ -175,6 +175,7 @@ Environment variables:
 
 - `MEETING_RECORDER_AUDIO_DEVICE`: AVFoundation audio index or name. Default: auto — a loopback/aggregate device (BlackHole, Aggregate, Loopback, …) if one is present, otherwise index `0`. Prefer a **name** over an index: AVFoundation indices are not stable across reboots/device changes, so `0` can silently become a webcam mic instead of your built-in mic.
 - `MEETING_RECORDER_SAMPLE_RATE`: output WAV sample rate. Default: `48000`.
+- `MEETING_RECORDER_AUDIO_SYNC`: keep recordings at real-time length. Default: `1`. ffmpeg's avfoundation capture under-delivers samples (~12% even on a bare mic, worse under load), which time-compresses audio and drifts timestamps; this pads genuine capture gaps with silence via wall-clock timestamps + async resampling. Set to `0` to disable.
 - `MEETING_RECORDER_ALLOW_MIC_ONLY`: set to `1` to silence the warning shown when recording a plain microphone instead of a loopback device.
 - `MEETING_RECORDER_DIR`: output directory. Default: `~/Meetings/Recordings`.
 - `MEETING_RECORDER_LOG`: log path. Default: `~/Library/Logs/meeting-recorder.log`.
