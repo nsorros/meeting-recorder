@@ -13,11 +13,9 @@ import datetime as dt
 import os
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -29,13 +27,19 @@ LAUNCH_AGENT_LABEL = "com.nsorros.meeting-recorder"
 LAUNCH_AGENT_PATH = Path(f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist").expanduser()
 STATE_DIR = Path(os.environ.get("MEETING_RECORDER_STATE_DIR", "~/.local/state/meeting-recorder")).expanduser()
 MANUAL_PID_FILE = STATE_DIR / "manual-recording.pid"
+# Published so the menu bar can show a real state (recording / transcribing /
+# watching) instead of a static label. Written by the watcher, read by the plugin.
+WATCHER_STATUS_FILE = STATE_DIR / "watcher-status"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-# Notifier app: gives notifications the Meeting Recorder logo instead of the
-# generic osascript icon. Built by `mrec install-app`; notify() falls back to
-# osascript when it is not installed.
-NOTIFIER_APP = Path("~/Applications/Meeting Recorder.app").expanduser()
-NOTIFIER_BUNDLE_ID = "com.nsorros.meeting-recorder-notifier"
-NOTIFY_QUEUE = STATE_DIR / "notify-queue"
+# Notification logo: osascript notifications are locked to the generic script
+# icon, so when terminal-notifier is installed we route through it with -appIcon
+# to show the Meeting Recorder mic logo. `mrec install-app` sets this up.
+NOTIFIER_BUNDLE_ID = "com.nsorros.meeting-recorder"
+NOTIFIER_ICON = ASSETS_DIR / "icon.png"
+# terminal-notifier must be invoked via its bundle binary (a PATH symlink breaks
+# its Info.plist lookup). Set MEETING_RECORDER_NO_LOGO=1 to force plain osascript.
+TERMINAL_NOTIFIER = Path("~/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier").expanduser()
+USE_LOGO = os.environ.get("MEETING_RECORDER_NO_LOGO", "").lower() not in {"1", "true", "yes"}
 AUDIO_DEVICE = os.environ.get("MEETING_RECORDER_AUDIO_DEVICE", "").strip()
 # Capture sample rate for the output WAV. The bare built-in mic sometimes gets
 # negotiated down to 24 kHz with dropouts; pinning the output rate keeps files
@@ -175,18 +179,43 @@ def osascript(script: str, timeout: int = 20) -> str:
     return proc.stdout.strip()
 
 
+def write_watcher_status(status: str, meeting: str = "") -> None:
+    """Publish the watcher's live state for the menu bar (recording / transcribing / watching)."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        WATCHER_STATUS_FILE.write_text(
+            f"status={status}\nmeeting={meeting}\nsince={int(time.time())}\npid={os.getpid()}\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        log(f"could not write watcher status: {exc}")
+
+
+def clear_watcher_status() -> None:
+    try:
+        WATCHER_STATUS_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log(f"could not clear watcher status: {exc}")
+
+
 def notify(title: str, text: str) -> None:
-    # Prefer the branded notifier app (shows the Meeting Recorder logo). It
-    # drains a queue directory, so we drop a "<title>\n<body>" file and open it.
-    if NOTIFIER_APP.exists():
+    # terminal-notifier (if installed) is a properly registered, notarized helper
+    # that can show our logo via -appIcon. osascript always works but macOS locks
+    # it to the generic script icon. (A compiled AppleScript applet cannot: on
+    # modern macOS its notifications are silently dropped as an unregistered
+    # notification client, so we do not use one.)
+    if USE_LOGO and TERMINAL_NOTIFIER.exists():
         try:
-            NOTIFY_QUEUE.mkdir(parents=True, exist_ok=True)
-            fname = f"{time.time_ns()}-{os.getpid()}.notify"
-            (NOTIFY_QUEUE / fname).write_text(f"{title}\n{text}", encoding="utf-8")
-            subprocess.run(["open", "-a", str(NOTIFIER_APP)], capture_output=True, timeout=10)
+            cmd = [str(TERMINAL_NOTIFIER), "-title", title, "-message", text,
+                   "-group", NOTIFIER_BUNDLE_ID]
+            if NOTIFIER_ICON.exists():
+                cmd += ["-appIcon", str(NOTIFIER_ICON)]
+            subprocess.run(cmd, capture_output=True, timeout=10)
             return
         except Exception as exc:
-            log(f"notifier app failed ({exc}); falling back to osascript")
+            log(f"terminal-notifier failed ({exc}); falling back to osascript")
     try:
         osascript(f'display notification {applescript_quote(text)} with title {applescript_quote(title)}')
     except Exception as exc:
@@ -211,18 +240,27 @@ def applescript_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def short_meeting_label(reason: str) -> str:
+    """Turn a raw detection string into a short, human platform label."""
+    low = reason.lower()
+    for hint, name in (
+        ("meet.google", "Google Meet"), ("google meet", "Google Meet"),
+        ("zoom", "Zoom"), ("teams", "Microsoft Teams"),
+        ("webex", "Webex"), ("whereby", "Whereby"),
+    ):
+        if hint in low:
+            return name
+    # Fallback: the app name before the first colon.
+    return reason.split(":", 1)[0].strip() or "Meeting"
+
+
 def ask_to_record(reason: str) -> bool:
-    message = (
-        f"I found what looks like a live meeting:\n\n{reason}\n\n"
-        "Do you want me to record it?\n\n"
-        "When the meeting ends, I will save the audio, run Whisper transcription, "
-        "and optionally clean the notes with Claude."
-    )
+    message = f"{short_meeting_label(reason)} detected. Record it?"
     script = (
         "display dialog "
         + applescript_quote(message)
-        + ' buttons {"Not this meeting", "Start recording"} default button "Start recording" '
-          'cancel button "Not this meeting" with title "Meeting Recorder" giving up after 30'
+        + ' buttons {"Dismiss", "Record"} default button "Record" '
+          'cancel button "Dismiss" with title "Meeting Recorder" giving up after 30'
     )
     log_section("meeting detected", reason=reason)
     try:
@@ -230,7 +268,7 @@ def ask_to_record(reason: str) -> bool:
     except Exception as exc:
         log(f"record prompt failed or declined: {exc}")
         return False
-    accepted = "button returned:Start recording" in out and "gave up:true" not in out
+    accepted = "button returned:Record" in out and "gave up:true" not in out
     log(f"user response: {'accepted recording' if accepted else 'declined or timed out'}")
     return accepted
 
@@ -614,6 +652,7 @@ def watch() -> None:
     notify("Meeting Recorder", "Watching for Meet, Zoom, Teams, Webex, and Whereby.")
     active = False
     declined_reason: str | None = None
+    write_watcher_status("watching")
     while True:
         reason = detect_meeting()
         if not reason:
@@ -634,7 +673,8 @@ def watch() -> None:
         audio: Path | None = None
         try:
             proc, audio = start_recording(reason)
-            notify("Meeting Recorder", f"Recording started. Audio will save to {display_path(audio)}")
+            write_watcher_status("recording", short_meeting_label(reason))
+            notify("Meeting Recorder", f"Recording {short_meeting_label(reason)}.")
             last_seen = time.time()
             last_check_in = time.time()
             while True:
@@ -663,6 +703,7 @@ def watch() -> None:
 
         if audio and audio.exists() and audio.stat().st_size > 1024:
             try:
+                write_watcher_status("transcribing", short_meeting_label(reason))
                 notify("Meeting Recorder", "Meeting ended. Transcribing now.")
                 final = transcribe_audio(audio)
                 alert(
@@ -679,6 +720,7 @@ def watch() -> None:
         elif audio:
             log(f"skipping transcription; missing or tiny audio file: {audio}")
 
+        write_watcher_status("watching")
         if active:
             time.sleep(POLL_SECONDS)
 
@@ -801,72 +843,25 @@ def doctor() -> int:
     return 0 if ok else 1
 
 
-def build_notifier_app() -> Path:
-    """Build/refresh the branded notifier app in ~/Applications.
-
-    Compiles the AppleScript applet (assets/notify.applescript), gives it the
-    microphone icon rendered from assets/icon.svg, sets a stable bundle id, and
-    registers it with Launch Services. Best-effort: if rsvg-convert/iconutil are
-    missing the app is still built, just with the default applet icon.
-    """
-    src = ASSETS_DIR / "notify.applescript"
-    icon_svg = ASSETS_DIR / "icon.svg"
-    if not src.exists():
-        raise RuntimeError(f"missing applet source: {src}")
-    NOTIFIER_APP.parent.mkdir(parents=True, exist_ok=True)
-    if NOTIFIER_APP.exists():
-        shutil.rmtree(NOTIFIER_APP)
-
-    result = run(["osacompile", "-o", str(NOTIFIER_APP), str(src)], timeout=60)
-    if result.returncode != 0:
-        raise RuntimeError(f"osacompile failed: {result.stderr.strip() or result.stdout.strip()}")
-
-    # Render the icon (best-effort).
-    if icon_svg.exists() and command_exists("rsvg-convert") and command_exists("iconutil"):
-        with tempfile.TemporaryDirectory() as tmp:
-            iconset = Path(tmp) / "icon.iconset"
-            iconset.mkdir()
-            for size in (16, 32, 128, 256, 512):
-                for scale, suffix in ((1, f"{size}x{size}"), (2, f"{size}x{size}@2x")):
-                    px = str(size * scale)
-                    run(["rsvg-convert", "-w", px, "-h", px, str(icon_svg),
-                         "-o", str(iconset / f"icon_{suffix}.png")], timeout=30)
-            icns = Path(tmp) / "AppIcon.icns"
-            if run(["iconutil", "-c", "icns", str(iconset), "-o", str(icns)], timeout=60).returncode == 0:
-                shutil.copyfile(icns, NOTIFIER_APP / "Contents" / "Resources" / "applet.icns")
-            else:
-                log("iconutil failed; notifier app will use the default icon")
-    else:
-        log("rsvg-convert/iconutil not available; notifier app will use the default icon")
-
-    # Stable identity + background-only (no Dock icon / focus steal).
-    plist = NOTIFIER_APP / "Contents" / "Info.plist"
-    for key, typ, value in (
-        ("CFBundleIdentifier", "string", NOTIFIER_BUNDLE_ID),
-        ("CFBundleName", "string", "Meeting Recorder"),
-        ("LSUIElement", "bool", "true"),
-    ):
-        if run(["/usr/libexec/PlistBuddy", "-c", f"Set :{key} {value}", str(plist)]).returncode != 0:
-            run(["/usr/libexec/PlistBuddy", "-c", f"Add :{key} {typ} {value}", str(plist)])
-
-    # Re-sign (bundle was modified) and register with Launch Services.
-    run(["codesign", "--force", "--deep", "-s", "-", str(NOTIFIER_APP)], timeout=60)
-    lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-    if Path(lsregister).exists():
-        run([lsregister, "-f", str(NOTIFIER_APP)], timeout=30)
-    return NOTIFIER_APP
+def render_notifier_icon() -> None:
+    """Render assets/icon.png from icon.svg for terminal-notifier's -appIcon (best-effort)."""
+    svg = ASSETS_DIR / "icon.svg"
+    if svg.exists() and command_exists("rsvg-convert"):
+        run(["rsvg-convert", "-w", "512", "-h", "512", str(svg), "-o", str(NOTIFIER_ICON)], timeout=30)
 
 
-def install_notifier_app() -> int:
-    try:
-        app = build_notifier_app()
-    except Exception as exc:
-        print(f"Could not build notifier app: {exc}")
-        return 1
-    print(f"Installed notifier app: {app}")
-    notify("Meeting Recorder", "Notifications now use the Meeting Recorder logo.")
-    print("Sent a test notification. If macOS asks, allow notifications for \"Meeting Recorder\".")
-    print("(System Settings > Notifications > Meeting Recorder to adjust.)")
+def install_notifier() -> int:
+    """Set up the notification logo. osascript notifications always work but show
+    the generic script icon; terminal-notifier + -appIcon shows the mic logo."""
+    render_notifier_icon()
+    if not TERMINAL_NOTIFIER.exists():
+        print("Notifications work via osascript, but show the generic script icon.")
+        print(f"To show the Meeting Recorder logo, install terminal-notifier.app at:\n  {TERMINAL_NOTIFIER.parents[2]}")
+        print("(download from github.com/julienXX/terminal-notifier/releases), then rerun 'mrec install-app'.")
+        return 0
+    notify("Meeting Recorder", "Logo test — notifications now use the mic icon.")
+    print("terminal-notifier found; sent a test notification with the logo.")
+    print("If nothing appears, allow it once: System Settings > Notifications > terminal-notifier > Allow.")
     return 0
 
 
@@ -937,9 +932,9 @@ def launch_service() -> str:
 
 def start_launch_agent() -> int:
     try:
-        build_notifier_app()
+        render_notifier_icon()
     except Exception as exc:
-        log(f"could not build notifier app ({exc}); notifications will use the default icon")
+        log(f"could not render notifier icon ({exc})")
     plist = install_launch_agent()
     subprocess.run(["launchctl", "bootout", launch_domain(), str(plist)], capture_output=True)
     proc = subprocess.run(["launchctl", "bootstrap", launch_domain(), str(plist)], text=True, capture_output=True)
@@ -1015,7 +1010,7 @@ def main() -> int:
         print(install_launch_agent())
         return 0
     if args.command == "install-app":
-        return install_notifier_app()
+        return install_notifier()
     if args.command == "start":
         return start_launch_agent()
     if args.command == "stop":
