@@ -20,6 +20,7 @@ Local macOS meeting recorder:
 ~/code/meeting-recorder/mrec record-stop
 ~/code/meeting-recorder/mrec transcribe ~/Meetings/Recordings/example.m4a
 ~/code/meeting-recorder/mrec install-app
+~/code/meeting-recorder/mrec build-recorder
 ```
 
 Recordings and transcripts are written under:
@@ -60,7 +61,24 @@ Set `MEETING_RECORDER_SILENCE_DB=` (empty) to disable the check.
 
 ## Audio Setup
 
-For "whatever goes into my ears and into the meeting", macOS needs a loopback or aggregate input device. The usual setup is:
+There are two capture backends, selected by `MEETING_RECORDER_CAPTURE_BACKEND` (default `auto`):
+
+### ScreenCaptureKit (default, recommended)
+
+`auto` captures **system audio + microphone** through ScreenCaptureKit — a native macOS API. There is **nothing to install**: no BlackHole, no Aggregate/Multi-Output device, and no default-output setting that a reboot can silently reset to plain speakers. This is how Notion/Granola capture meetings.
+
+The only prerequisite is a one-time permission grant. Build the helper and grant permission once:
+
+```sh
+mrec build-recorder
+# then: System Settings > Privacy & Security > Screen Recording > enable the app that runs mrec
+```
+
+The two sources are recorded to separate WAVs and mixed to a single mono file with ffmpeg when the meeting ends. Set `MEETING_RECORDER_SCK_NO_MIC=1` to capture system audio only. If the helper can't build or permission isn't granted, `auto` transparently falls back to the ffmpeg path below (force it with `MEETING_RECORDER_CAPTURE_BACKEND=ffmpeg`, or require ScreenCaptureKit with `screencapturekit`).
+
+### ffmpeg + BlackHole loopback (fallback, portable)
+
+For "whatever goes into my ears and into the meeting" via ffmpeg, macOS needs a loopback or aggregate input device. The usual setup is:
 
 1. Install BlackHole 2ch.
 2. Open Audio MIDI Setup.
@@ -204,7 +222,10 @@ Menu actions:
 
 Environment variables:
 
-- `MEETING_RECORDER_AUDIO_DEVICE`: AVFoundation audio index or name. Default: auto — a loopback/aggregate device (BlackHole, Aggregate, Loopback, …) if one is present, otherwise index `0`. Prefer a **name** over an index: AVFoundation indices are not stable across reboots/device changes, so `0` can silently become a webcam mic instead of your built-in mic.
+- `MEETING_RECORDER_CAPTURE_BACKEND`: `auto` (default — ScreenCaptureKit system+mic capture, falling back to ffmpeg if it can't build/run), `screencapturekit`/`sck` (force ScreenCaptureKit, error instead of falling back), or `ffmpeg` (force the legacy loopback path).
+- `MEETING_RECORDER_SCK_NO_MIC`: set to `1` to capture system audio only in the ScreenCaptureKit path (skip the microphone).
+- `MEETING_RECORDER_SCK_BIN`: path to the compiled `sck-recorder` helper. Default: `bin/sck-recorder` next to the script (built on demand).
+- `MEETING_RECORDER_AUDIO_DEVICE`: AVFoundation audio index or name (ffmpeg backend only). Default: auto — a loopback/aggregate device (BlackHole, Aggregate, Loopback, …) if one is present, otherwise index `0`. Prefer a **name** over an index: AVFoundation indices are not stable across reboots/device changes, so `0` can silently become a webcam mic instead of your built-in mic.
 - `MEETING_RECORDER_SAMPLE_RATE`: output WAV sample rate. Default: `48000`.
 - `MEETING_RECORDER_AUDIO_SYNC`: keep recordings at real-time length. Default: `1`. ffmpeg's avfoundation capture under-delivers samples (~12% even on a bare mic, worse under load), which time-compresses audio and drifts timestamps; this pads genuine capture gaps with silence via wall-clock timestamps + async resampling. Set to `0` to disable.
 - `MEETING_RECORDER_ALLOW_MIC_ONLY`: set to `1` to silence the warning shown when recording a plain microphone instead of a loopback device.

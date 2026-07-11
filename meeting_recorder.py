@@ -67,6 +67,20 @@ LOOPBACK_HINTS = ("blackhole", "aggregate", "loopback", "soundflower", "vb-cable
 AUDIO_SYNC = os.environ.get("MEETING_RECORDER_AUDIO_SYNC", "1").lower() not in {"0", "false", "no"}
 # Set to 1/true to silence the "recording microphone only" warning.
 ALLOW_MIC_ONLY = os.environ.get("MEETING_RECORDER_ALLOW_MIC_ONLY", "").lower() in {"1", "true", "yes"}
+# --- Capture backend -----------------------------------------------------
+# "auto" (default): capture system audio + mic via ScreenCaptureKit (a native
+#   macOS API — no BlackHole, no Multi-Output device, survives reboots), and
+#   fall back to the ffmpeg/avfoundation loopback path if the helper can't build
+#   or run (e.g. Screen Recording permission not yet granted).
+# "screencapturekit"/"sck": force ScreenCaptureKit; error out instead of falling back.
+# "ffmpeg": force the legacy ffmpeg + loopback/aggregate device path.
+CAPTURE_BACKEND = os.environ.get("MEETING_RECORDER_CAPTURE_BACKEND", "auto").strip().lower()
+# Skip microphone capture in the ScreenCaptureKit path (system audio only).
+SCK_NO_MIC = os.environ.get("MEETING_RECORDER_SCK_NO_MIC", "").lower() in {"1", "true", "yes"}
+RECORDER_SRC = Path(__file__).resolve().parent / "recorder" / "main.swift"
+RECORDER_BIN = Path(
+    os.environ.get("MEETING_RECORDER_SCK_BIN", str(Path(__file__).resolve().parent / "bin" / "sck-recorder"))
+).expanduser()
 POLL_SECONDS = int(os.environ.get("MEETING_RECORDER_POLL_SECONDS", "10"))
 END_GRACE_SECONDS = int(os.environ.get("MEETING_RECORDER_END_GRACE_SECONDS", "45"))
 CHECK_IN_SECONDS = int(os.environ.get("MEETING_RECORDER_CHECK_IN_SECONDS", "1800"))
@@ -474,10 +488,95 @@ def slug(value: str) -> str:
     return value[:80] or "meeting"
 
 
+def ensure_recorder_built() -> Path:
+    """Compile recorder/main.swift into the sck-recorder helper if needed.
+
+    Rebuilds when the binary is missing or older than the source. Raises on any
+    failure so callers can fall back to the ffmpeg path."""
+    if not RECORDER_SRC.exists():
+        raise RuntimeError(f"missing recorder source: {RECORDER_SRC}")
+    if RECORDER_BIN.exists() and RECORDER_BIN.stat().st_mtime >= RECORDER_SRC.stat().st_mtime:
+        return RECORDER_BIN
+    if not command_exists("xcrun"):
+        raise RuntimeError("Xcode command line tools required (xcrun not found); run: xcode-select --install")
+    RECORDER_BIN.parent.mkdir(parents=True, exist_ok=True)
+    res = run(
+        ["xcrun", "swiftc", "-O", str(RECORDER_SRC), "-o", str(RECORDER_BIN),
+         "-framework", "ScreenCaptureKit", "-framework", "AVFoundation", "-framework", "CoreMedia"],
+        timeout=180,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"swiftc failed: {res.stderr.strip() or res.stdout.strip()}")
+    RECORDER_BIN.chmod(0o755)
+    return RECORDER_BIN
+
+
+def _start_screencapturekit(reason: str, path: Path) -> subprocess.Popen[bytes] | None:
+    """Start the ScreenCaptureKit helper. Returns None (so the caller can fall
+    back) if the platform, build, or first few seconds of capture fail."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        binary = ensure_recorder_built()
+    except Exception as exc:
+        log(f"sck: could not build recorder helper ({exc})")
+        return None
+
+    system_wav = path.with_name(path.stem + ".system.wav")
+    mic_wav = path.with_name(path.stem + ".mic.wav")
+    cmd = [str(binary), "--output", str(system_wav), "--sample-rate", SAMPLE_RATE]
+    if not SCK_NO_MIC:
+        cmd += ["--mic-output", str(mic_wav)]
+    log_section(
+        "recording started",
+        meeting=reason,
+        backend="screencapturekit",
+        audio_file=display_path(path),
+        capture=("system audio only" if SCK_NO_MIC else "system audio + microphone (both sides)"),
+    )
+    log("sck command: " + shlex.join(cmd))
+
+    sck_log_path = path.with_name(path.stem + ".sck.log")
+    sck_log = open(sck_log_path, "w", encoding="utf-8")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=sck_log)
+    time.sleep(3)
+    if proc.poll() is not None:
+        sck_log.close()
+        err = ""
+        try:
+            err = sck_log_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            pass
+        log(f"sck: recorder exited early (rc={proc.returncode}): {err}")
+        return None
+
+    proc.mr_backend = "screencapturekit"  # type: ignore[attr-defined]
+    proc.mr_parts = [system_wav, mic_wav]  # type: ignore[attr-defined]
+    proc.mr_final = path  # type: ignore[attr-defined]
+    proc.mr_sck_log = sck_log  # type: ignore[attr-defined]  # keep the file handle alive
+    return proc
+
+
 def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
     ROOT.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     path = ROOT / f"{now}_{slug(reason)}.wav"
+
+    if CAPTURE_BACKEND in ("auto", "screencapturekit", "sck"):
+        proc = _start_screencapturekit(reason, path)
+        if proc is not None:
+            return proc, path
+        if CAPTURE_BACKEND != "auto":
+            raise RuntimeError(
+                "ScreenCaptureKit backend unavailable (build failed or Screen Recording "
+                "permission not granted); see the log. Run 'mrec doctor' for details."
+            )
+        log("ScreenCaptureKit unavailable; falling back to ffmpeg/avfoundation loopback capture")
+
+    return _start_ffmpeg(reason, path), path
+
+
+def _start_ffmpeg(reason: str, path: Path) -> subprocess.Popen[bytes]:
     device_arg, device_name, is_loopback = resolve_audio_device()
     cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y"]
     if AUDIO_SYNC:
@@ -505,10 +604,14 @@ def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
     time.sleep(3)
     if proc.poll() is not None:
         raise RuntimeError("ffmpeg exited early; run mrec doctor to check audio permissions and device selection")
-    return proc, path
+    proc.mr_backend = "ffmpeg"  # type: ignore[attr-defined]
+    return proc
 
 
 def stop_recording(proc: subprocess.Popen[bytes]) -> None:
+    if getattr(proc, "mr_backend", "ffmpeg") == "screencapturekit":
+        _stop_screencapturekit(proc)
+        return
     if proc.poll() is not None:
         return
     try:
@@ -523,6 +626,72 @@ def stop_recording(proc: subprocess.Popen[bytes]) -> None:
             proc.wait(timeout=8)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def _stop_screencapturekit(proc: subprocess.Popen[bytes]) -> None:
+    """Signal the helper to finalize its WAV files, then mix system+mic into the
+    single output file the transcription pipeline expects."""
+    if proc.poll() is None:
+        try:
+            log("stopping recording (screencapturekit)")
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=20)
+        except Exception:
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    sck_log = getattr(proc, "mr_sck_log", None)
+    if sck_log is not None:
+        try:
+            sck_log.close()
+        except OSError:
+            pass
+    parts = getattr(proc, "mr_parts", None)
+    final = getattr(proc, "mr_final", None)
+    if parts and final:
+        _mix_capture_parts(parts, final)
+
+
+def _mix_capture_parts(parts: list[Path], final: Path) -> None:
+    """Mix the system-audio and mic WAVs into a single mono file for transcription.
+
+    amix with normalize=0 keeps both sources at full level (they rarely peak at
+    once, and Whisper/Gemini are tolerant of the occasional overlap). If only one
+    source produced audio we just transcode that. On any failure we preserve the
+    system-audio track (the far side) so a meeting is never silently lost."""
+    system_wav, mic_wav = parts[0], parts[1] if len(parts) > 1 else None
+    have_sys = system_wav.exists() and system_wav.stat().st_size > 1024
+    have_mic = bool(mic_wav) and mic_wav.exists() and mic_wav.stat().st_size > 1024
+
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y"]
+    if have_sys and have_mic:
+        cmd += [
+            "-i", str(system_wav), "-i", str(mic_wav),
+            "-filter_complex", "amix=inputs=2:duration=longest:dropout_transition=0:normalize=0",
+        ]
+    elif have_sys:
+        cmd += ["-i", str(system_wav)]
+    elif have_mic:
+        cmd += ["-i", str(mic_wav)]
+    else:
+        log("sck: no audio captured (system and mic both empty) — check Screen Recording permission / audio output")
+        return
+    cmd += ["-ac", "1", "-ar", SAMPLE_RATE, "-acodec", "pcm_s16le", str(final)]
+
+    res = run(cmd, timeout=180)
+    if res.returncode != 0:
+        log(f"sck: mixing failed ({res.stderr.strip() or res.stdout.strip()})")
+        if have_sys and not final.exists():
+            shutil.copyfile(system_wav, final)  # don't lose the far-side audio
+        return
+    for part in (system_wav, mic_wav):
+        if part:
+            try:
+                part.unlink()
+            except OSError:
+                pass
 
 
 def audio_duration_seconds(audio: Path) -> float | None:
@@ -844,6 +1013,7 @@ def watch() -> None:
         log=display_path(LOG),
         poll_seconds=POLL_SECONDS,
         end_grace_seconds=END_GRACE_SECONDS,
+        capture_backend=CAPTURE_BACKEND,
         audio_input=audio_device_arg(),
         whisper_model=WHISPER_MODEL,
         claude_cleanup="disabled" if DISABLE_CLAUDE else "enabled",
@@ -1019,6 +1189,30 @@ def doctor() -> int:
         ok = ok and exists
     print(f"recordings: {ROOT}")
     print(f"log: {LOG}")
+
+    print(f"\ncapture backend: {CAPTURE_BACKEND}")
+    if CAPTURE_BACKEND in ("auto", "screencapturekit", "sck"):
+        if command_exists("xcrun"):
+            print("xcrun (swiftc): ok")
+            try:
+                binary = ensure_recorder_built()
+                print(f"sck-recorder: built at {display_path(binary)}")
+                print("ScreenCaptureKit: ✅ system audio + mic, no BlackHole/Multi-Output needed.")
+                print("         First run needs a one-time Screen Recording permission grant")
+                print('         (System Settings > Privacy & Security > Screen Recording).')
+            except Exception as exc:
+                print(f"sck-recorder: ⚠️  could not build ({exc})")
+                if CAPTURE_BACKEND == "auto":
+                    print("         Will fall back to the ffmpeg/loopback path below.")
+                else:
+                    ok = False
+        else:
+            print("xcrun (swiftc): missing — install Xcode command line tools (xcode-select --install)")
+            if CAPTURE_BACKEND == "auto":
+                print("         Will fall back to the ffmpeg/loopback path below.")
+            else:
+                ok = False
+
     print("\nAVFoundation devices:")
     devices = list_audio_devices()
     print(devices or "(none visible)")
@@ -1102,6 +1296,20 @@ def build_notifier_app() -> Path:
     return NOTIFIER_APP
 
 
+def build_recorder() -> int:
+    """Compile the ScreenCaptureKit capture helper (sck-recorder)."""
+    try:
+        binary = ensure_recorder_built()
+    except Exception as exc:
+        print(f"Could not build sck-recorder: {exc}")
+        print("The recorder will fall back to ffmpeg/BlackHole loopback capture.")
+        return 1
+    print(f"Built sck-recorder: {display_path(binary)}")
+    print("First use needs a one-time Screen Recording permission grant:")
+    print("  System Settings > Privacy & Security > Screen Recording > enable the app that runs it.")
+    return 0
+
+
 def install_notifier() -> int:
     """Build the native notifier app so notifications show the Meeting Recorder logo."""
     try:
@@ -1129,7 +1337,12 @@ def install_launch_agent() -> Path:
         "MEETING_RECORDER_END_GRACE_SECONDS": str(END_GRACE_SECONDS),
         "MEETING_RECORDER_SAMPLE_RATE": SAMPLE_RATE,
         "MEETING_RECORDER_AUDIO_SYNC": "1" if AUDIO_SYNC else "0",
+        "MEETING_RECORDER_CAPTURE_BACKEND": CAPTURE_BACKEND,
     }
+    if RECORDER_BIN != Path(__file__).resolve().parent / "bin" / "sck-recorder":
+        env_vars["MEETING_RECORDER_SCK_BIN"] = str(RECORDER_BIN)
+    if SCK_NO_MIC:
+        env_vars["MEETING_RECORDER_SCK_NO_MIC"] = "1"
     if AUDIO_DEVICE:
         env_vars["MEETING_RECORDER_AUDIO_DEVICE"] = AUDIO_DEVICE
     if LANGUAGE:
@@ -1187,6 +1400,11 @@ def start_launch_agent() -> int:
         build_notifier_app()
     except Exception as exc:
         log(f"could not build notifier app ({exc}); notifications will use the generic icon")
+    if CAPTURE_BACKEND in ("auto", "screencapturekit", "sck"):
+        try:
+            ensure_recorder_built()
+        except Exception as exc:
+            log(f"could not build sck-recorder ({exc}); capture will fall back to ffmpeg/loopback")
     plist = install_launch_agent()
     subprocess.run(["launchctl", "bootout", launch_domain(), str(plist)], capture_output=True)
     proc = subprocess.run(["launchctl", "bootstrap", launch_domain(), str(plist)], text=True, capture_output=True)
@@ -1237,6 +1455,7 @@ def main() -> int:
     tr.add_argument("audio")
     sub.add_parser("install-launch-agent", help="write the LaunchAgent plist")
     sub.add_parser("install-app", help="build the branded notifier app (logo for notifications)")
+    sub.add_parser("build-recorder", help="compile the ScreenCaptureKit capture helper (sck-recorder)")
     sub.add_parser("start", help="install and start the login background watcher")
     sub.add_parser("stop", help="stop the login background watcher")
     sub.add_parser("status", help="show whether the login background watcher is running")
@@ -1263,6 +1482,8 @@ def main() -> int:
         return 0
     if args.command == "install-app":
         return install_notifier()
+    if args.command == "build-recorder":
+        return build_recorder()
     if args.command == "start":
         return start_launch_agent()
     if args.command == "stop":
