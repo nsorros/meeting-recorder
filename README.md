@@ -5,10 +5,10 @@ Local macOS meeting recorder:
 1. watches for Google Meet, Teams, Zoom, Webex, or Whereby in browsers/apps
 2. asks before recording
 3. records the configured macOS audio input with `ffmpeg` as `.wav`
-4. transcribes with local `whisper`
+4. transcribes via **OpenRouter** (cloud; seconds per file) with automatic fallback to local `whisper`
 5. optionally asks `claude -p` to clean the raw transcript into notes
 
-`claude -p` is not used as the speech recognizer. Whisper does the audio transcription. Claude is only the cleanup/summary pass.
+`claude -p` is not used as the speech recognizer. OpenRouter (or local Whisper) does the audio transcription. Claude is only the cleanup/summary pass.
 
 ## Commands
 
@@ -33,6 +33,30 @@ Logs are written to:
 ```sh
 ~/Library/Logs/meeting-recorder.log
 ```
+
+## Transcription Engine
+
+Transcription defaults to **OpenRouter** (`google/gemini-2.5-flash`): the `.wav` is
+transcoded to 16 kHz mono mp3, chunked, and transcribed in seconds for roughly
+$0.12 per hour of audio (`google/gemini-2.5-flash-lite` is ~$0.035/hr). It falls
+back to **local Whisper** automatically when there is no API key, no network, no
+credits, or any request error — so a run never depends on connectivity.
+
+```sh
+# engine: "openrouter" (default) or "whisper" to force local-only
+export MEETING_RECORDER_TRANSCRIBE_ENGINE=openrouter
+export MEETING_RECORDER_OPENROUTER_MODEL=google/gemini-2.5-flash
+# provide the key directly...
+export MEETING_RECORDER_OPENROUTER_API_KEY=sk-or-v1-...
+# ...or point at a dotenv file to read OPENROUTER_API_KEY from (e.g. the ant app)
+export MEETING_RECORDER_OPENROUTER_ENV_FILE=~/code/ant/.env
+```
+
+A **silence guard** aborts transcription with an actionable error when a recording
+is digital silence (mean ≤ `MEETING_RECORDER_SILENCE_DB`, default `-80` dBFS) —
+the usual cause is the system output device being reset away from the
+Multi-Output/BlackHole loopback after a reboot, so nothing reaches the recorder.
+Set `MEETING_RECORDER_SILENCE_DB=` (empty) to disable the check.
 
 ## Audio Setup
 
@@ -186,8 +210,16 @@ Environment variables:
 - `MEETING_RECORDER_ALLOW_MIC_ONLY`: set to `1` to silence the warning shown when recording a plain microphone instead of a loopback device.
 - `MEETING_RECORDER_DIR`: output directory. Default: `~/Meetings/Recordings`.
 - `MEETING_RECORDER_LOG`: log path. Default: `~/Library/Logs/meeting-recorder.log`.
-- `MEETING_RECORDER_WHISPER_MODEL`: Whisper model. Default: `turbo`.
-- `MEETING_RECORDER_LANGUAGE`: optional Whisper language.
+- `MEETING_RECORDER_TRANSCRIBE_ENGINE`: `openrouter` (default) or `whisper` (force local-only). OpenRouter falls back to Whisper on any key/network/credit/API error.
+- `MEETING_RECORDER_OPENROUTER_MODEL`: OpenRouter audio model. Default: `google/gemini-2.5-flash` (try `google/gemini-2.5-flash-lite` for ~3× cheaper).
+- `MEETING_RECORDER_OPENROUTER_API_KEY` / `OPENROUTER_API_KEY`: the key. If neither is set, `MEETING_RECORDER_OPENROUTER_ENV_FILE` is read.
+- `MEETING_RECORDER_OPENROUTER_ENV_FILE`: optional dotenv file to read `OPENROUTER_API_KEY` from (e.g. `~/code/ant/.env`).
+- `MEETING_RECORDER_OPENROUTER_CHUNK_SECONDS`: audio chunk length sent per request. Default: `600`.
+- `MEETING_RECORDER_OPENROUTER_TIMEOUT` / `MEETING_RECORDER_OPENROUTER_MAX_RETRIES`: per-request timeout (`300`s) and retry count (`3`).
+- `MEETING_RECORDER_OPENROUTER_PROMPT`: override the transcription instruction.
+- `MEETING_RECORDER_SILENCE_DB`: mean dBFS at/below which a recording is treated as silent and transcription aborts with an actionable error. Default: `-80`. Empty disables.
+- `MEETING_RECORDER_WHISPER_MODEL`: Whisper model (local engine / fallback). Default: `turbo`.
+- `MEETING_RECORDER_LANGUAGE`: optional transcription language (both engines).
 - `MEETING_RECORDER_CONDITION_ON_PREVIOUS_TEXT`: `True`/`False`. Default: `False`. Keeping this `False` stops Whisper repeating the previous line (the "Thank you… Thank you…" loops) across silences.
 - `MEETING_RECORDER_NO_SPEECH_THRESHOLD`: probability above which a segment is treated as silence and dropped. Default: `0.6`.
 - `MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD`: seconds — skip silent stretches longer than this when a hallucination is detected (needs word timestamps, which the tool enables automatically). Default: `2`. Set to empty to disable.

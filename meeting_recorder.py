@@ -2,14 +2,18 @@
 """Background meeting recorder for macOS.
 
 Detects browser/app meetings, asks before recording, records a configured
-audio input with ffmpeg, transcribes with Whisper, then optionally cleans the
-transcript with `claude -p`.
+audio input with ffmpeg, transcribes with OpenRouter (cloud; fast and cheap)
+falling back to local Whisper when there is no key/network/credits, then
+optionally cleans the transcript with `claude -p`.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
+import json
+import math
 import os
 import re
 import shlex
@@ -19,6 +23,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -78,6 +84,38 @@ WHISPER_NO_SPEECH_THRESHOLD = os.environ.get("MEETING_RECORDER_NO_SPEECH_THRESHO
 WHISPER_HALLUCINATION_SILENCE_THRESHOLD = os.environ.get("MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD", "2").strip()
 CLAUDE_MODEL = os.environ.get("MEETING_RECORDER_CLAUDE_MODEL", "")
 DISABLE_CLAUDE = os.environ.get("MEETING_RECORDER_DISABLE_CLAUDE", "").lower() in {"1", "true", "yes"}
+# --- Transcription engine ------------------------------------------------
+# "openrouter" (default): transcode to 16 kHz mono mp3 and transcribe via an
+# OpenRouter audio-capable model (Gemini Flash by default) — seconds per file
+# and ~$0.12/hr of audio, vs. minutes-to-hours for local Whisper on CPU. Falls
+# back automatically to local Whisper when there is no API key, no network, no
+# credits (HTTP 401/402/403), or any request error. Set to "whisper" to force
+# local-only.
+TRANSCRIBE_ENGINE = os.environ.get("MEETING_RECORDER_TRANSCRIBE_ENGINE", "openrouter").strip().lower()
+OPENROUTER_BASE_URL = os.environ.get(
+    "MEETING_RECORDER_OPENROUTER_BASE_URL",
+    os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+).strip()
+OPENROUTER_MODEL = os.environ.get("MEETING_RECORDER_OPENROUTER_MODEL", "google/gemini-2.5-flash").strip()
+# Audio is chunked into segments this many seconds long so request bodies stay
+# small (Gemini bills ~25 audio tokens/sec; 600s ≈ 15k tokens, ~2.4 MB mp3).
+OPENROUTER_CHUNK_SECONDS = int(os.environ.get("MEETING_RECORDER_OPENROUTER_CHUNK_SECONDS", "600"))
+OPENROUTER_TIMEOUT = int(os.environ.get("MEETING_RECORDER_OPENROUTER_TIMEOUT", "300"))
+OPENROUTER_MAX_RETRIES = int(os.environ.get("MEETING_RECORDER_OPENROUTER_MAX_RETRIES", "3"))
+OPENROUTER_PROMPT = os.environ.get(
+    "MEETING_RECORDER_OPENROUTER_PROMPT",
+    "Transcribe this meeting audio verbatim. Output only the transcript text, with no "
+    "commentary, headings, or timestamps. If there is no intelligible speech, output nothing.",
+)
+# Optional dotenv-style file to read OPENROUTER_API_KEY from when it is not in
+# the environment (e.g. the ant app's ~/code/ant/.env). Only the key line is read.
+OPENROUTER_ENV_FILE = os.environ.get("MEETING_RECORDER_OPENROUTER_ENV_FILE", "").strip()
+# Silence guard: a reboot can reset the default output device away from the
+# Multi-Output/BlackHole loopback, so ffmpeg captures pure digital silence.
+# Recordings at or below this mean dBFS abort with an actionable error instead
+# of wasting minutes/hours "transcribing" nothing. Empty disables the guard.
+_silence_db_raw = os.environ.get("MEETING_RECORDER_SILENCE_DB", "-80").strip()
+SILENCE_DB = float(_silence_db_raw) if _silence_db_raw else None
 # Speaker labels. The Claude cleanup always attributes turns to speakers from
 # context (names if mentioned, else consistent role labels). For true acoustic
 # per-person diarization, set MEETING_RECORDER_DIARIZE=1 with whisperx installed
@@ -487,9 +525,75 @@ def stop_recording(proc: subprocess.Popen[bytes]) -> None:
             proc.kill()
 
 
+def audio_duration_seconds(audio: Path) -> float | None:
+    """Return the audio duration in seconds via ffprobe, or None if unknown."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(audio)],
+            text=True, capture_output=True, timeout=60,
+        )
+        return float(proc.stdout.strip())
+    except Exception:
+        return None
+
+
+def audio_mean_volume_db(audio: Path) -> float | None:
+    """Return the mean volume in dBFS via ffmpeg volumedetect, or None if unmeasurable.
+
+    Digital silence reads as ~-91 dB (the 16-bit noise floor); real speech is
+    typically -60..-20 dB.
+    """
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", str(audio),
+             "-af", "volumedetect", "-f", "null", "-"],
+            text=True, capture_output=True, timeout=600,
+        )
+    except Exception:
+        return None
+    m = re.search(r"mean_volume:\s*(-?[0-9.]+) dB", proc.stderr)
+    return float(m.group(1)) if m else None
+
+
 def transcribe_audio(audio: Path) -> Path:
     out_dir = audio.with_suffix("")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Silence guard: fail fast (and usefully) instead of transcribing nothing.
+    if SILENCE_DB is not None:
+        mean_db = audio_mean_volume_db(audio)
+        if mean_db is not None and mean_db <= SILENCE_DB:
+            raise RuntimeError(
+                f"recording is silent (mean {mean_db:.1f} dB) — no meeting audio was captured. "
+                "Set the system audio output to the Multi-Output Device so loopback (BlackHole) "
+                "receives sound, then re-record. (Set MEETING_RECORDER_SILENCE_DB= to disable "
+                "this check.)"
+            )
+
+    raw_txt: Path | None = None
+    if TRANSCRIBE_ENGINE == "openrouter":
+        try:
+            raw_txt = transcribe_with_openrouter(audio, out_dir)
+        except Exception as exc:
+            log(f"openrouter transcription failed ({exc}); falling back to local whisper")
+    if raw_txt is None:
+        raw_txt = transcribe_with_whisper(audio, out_dir)
+
+    diarized_txt = diarize_with_whisperx(audio, out_dir) if DIARIZE else None
+
+    final_md = out_dir / f"{audio.stem}.meeting.md"
+    if DISABLE_CLAUDE:
+        log("claude cleanup disabled; writing basic markdown transcript")
+        write_basic_meeting_md(diarized_txt or raw_txt, final_md, audio)
+    else:
+        clean_with_claude(raw_txt, final_md, audio, diarized_txt=diarized_txt)
+    log_section("transcription finished", final_notes=display_path(final_md), raw_transcript=display_path(raw_txt))
+    return final_md
+
+
+def transcribe_with_whisper(audio: Path, out_dir: Path) -> Path:
+    """Local Whisper transcription. Returns the raw .txt transcript path."""
     cmd = ["whisper", str(audio), "--model", WHISPER_MODEL, "--output_dir", str(out_dir), "--output_format", "all"]
     # Suppress silence hallucinations (see WHISPER_* config above).
     cmd.extend([
@@ -514,17 +618,110 @@ def transcribe_audio(audio: Path) -> Path:
         if not candidates:
             raise RuntimeError(f"whisper produced no txt output in {out_dir}")
         raw_txt = candidates[0]
+    return raw_txt
 
-    diarized_txt = diarize_with_whisperx(audio, out_dir) if DIARIZE else None
 
-    final_md = out_dir / f"{audio.stem}.meeting.md"
-    if DISABLE_CLAUDE:
-        log("claude cleanup disabled; writing basic markdown transcript")
-        write_basic_meeting_md(diarized_txt or raw_txt, final_md, audio)
-    else:
-        clean_with_claude(raw_txt, final_md, audio, diarized_txt=diarized_txt)
-    log_section("transcription finished", final_notes=display_path(final_md), raw_transcript=display_path(raw_txt))
-    return final_md
+def openrouter_api_key() -> str:
+    """Resolve the OpenRouter key from the environment, or an optional env file."""
+    for var in ("MEETING_RECORDER_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    if OPENROUTER_ENV_FILE:
+        try:
+            for line in Path(OPENROUTER_ENV_FILE).expanduser().read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("OPENROUTER_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return ""
+
+
+def openrouter_transcribe_chunk(mp3: Path, key: str) -> str:
+    """Transcribe one mp3 chunk via the OpenRouter chat/completions audio API.
+
+    Raises on auth/credit failures (401/402/403) and on exhausted retries so the
+    caller can fall back to local Whisper.
+    """
+    data_b64 = base64.b64encode(mp3.read_bytes()).decode("ascii")
+    prompt = OPENROUTER_PROMPT
+    if LANGUAGE:
+        prompt += f" The audio language is {LANGUAGE}."
+    body = json.dumps({
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "input_audio", "input_audio": {"data": data_b64, "format": "mp3"}},
+        ]}],
+        "temperature": 0,
+    }).encode("utf-8")
+    url = OPENROUTER_BASE_URL.rstrip("/") + "/chat/completions"
+    last_exc: Exception | None = None
+    for attempt in range(OPENROUTER_MAX_RETRIES):
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=OPENROUTER_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if payload.get("error"):
+                raise RuntimeError(str(payload["error"])[:300])
+            return payload["choices"][0]["message"].get("content") or ""
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            # Auth/credit problems won't fix themselves — fail now to trigger fallback.
+            if exc.code in (401, 402, 403):
+                raise RuntimeError(f"openrouter HTTP {exc.code}: {detail}")
+            last_exc = RuntimeError(f"openrouter HTTP {exc.code}: {detail}")
+        except Exception as exc:
+            last_exc = exc
+        time.sleep(2 * (attempt + 1))
+    raise last_exc or RuntimeError("openrouter request failed")
+
+
+def transcribe_with_openrouter(audio: Path, out_dir: Path) -> Path:
+    """Cloud transcription via OpenRouter. Returns the raw .txt transcript path.
+
+    Transcodes to 16 kHz mono mp3 and sends the audio in OPENROUTER_CHUNK_SECONDS
+    segments, concatenating the results. Raises on any failure so the caller can
+    fall back to local Whisper.
+    """
+    key = openrouter_api_key()
+    if not key:
+        raise RuntimeError("no OpenRouter API key (set MEETING_RECORDER_OPENROUTER_API_KEY, "
+                           "OPENROUTER_API_KEY, or MEETING_RECORDER_OPENROUTER_ENV_FILE)")
+    if not command_exists("ffmpeg") or not command_exists("ffprobe"):
+        raise RuntimeError("ffmpeg/ffprobe are required for OpenRouter transcription")
+
+    log_section("transcription started", audio_file=display_path(audio),
+                output_dir=display_path(out_dir), engine=f"openrouter:{OPENROUTER_MODEL}")
+    duration = audio_duration_seconds(audio) or 0.0
+    nchunks = max(1, int(math.ceil(duration / OPENROUTER_CHUNK_SECONDS))) if duration else 1
+    parts: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="mrec-or-") as tmp:
+        tmpdir = Path(tmp)
+        for idx in range(nchunks):
+            start = idx * OPENROUTER_CHUNK_SECONDS
+            mp3 = tmpdir / f"chunk_{idx:03d}.mp3"
+            enc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y",
+                 "-ss", str(start), "-t", str(OPENROUTER_CHUNK_SECONDS), "-i", str(audio),
+                 "-ac", "1", "-ar", "16000", "-b:a", "32k", str(mp3)],
+                text=True, capture_output=True,
+            )
+            if enc.returncode != 0 or not mp3.exists() or mp3.stat().st_size < 512:
+                continue  # trailing/empty segment
+            text = openrouter_transcribe_chunk(mp3, key).strip()
+            if text:
+                parts.append(text)
+            log(f"openrouter chunk {idx + 1}/{nchunks} done ({len(text)} chars)")
+    if not parts:
+        raise RuntimeError("openrouter returned no transcript text")
+    raw_txt = out_dir / f"{audio.stem}.txt"
+    raw_txt.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    return raw_txt
 
 
 def diarize_with_whisperx(audio: Path, out_dir: Path) -> Path | None:
