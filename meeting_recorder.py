@@ -137,6 +137,32 @@ SILENCE_DB = float(_silence_db_raw) if _silence_db_raw else None
 # speaker-tagged transcript is fed to the cleanup instead of the plain one.
 DIARIZE = os.environ.get("MEETING_RECORDER_DIARIZE", "").lower() in {"1", "true", "yes"}
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or ""
+# --- Meeting naming ------------------------------------------------------
+# The recording file is named after the meeting. Best effort, in order:
+#   1. a Google Calendar event happening right now (via the `gog` CLI), which
+#      gives the real human title ("Danil / Nick - 1 on 1") instead of the
+#      generic tab ("Meet - abc-defg-hij");
+#   2. a cleaned-up browser-tab title (platform noise + Meet codes stripped);
+#   3. the bare platform label ("Google Meet").
+# Set MEETING_RECORDER_CALENDAR=0 to skip the calendar lookup entirely.
+CALENDAR_LOOKUP = os.environ.get("MEETING_RECORDER_CALENDAR", "1").lower() not in {"0", "false", "no"}
+# Which calendars to consult, as a comma-separated list of `client=account`
+# pairs passed through to `gog` (either side may be blank to use gog's default).
+# Default covers Nick's two orgs: mantis (gog default) + finant.
+CALENDAR_ACCOUNTS = os.environ.get(
+    "MEETING_RECORDER_CALENDAR_ACCOUNTS", "=,finant=nick@finant.ai"
+).strip()
+# gog binary (calendar lookup is skipped gracefully if it is missing).
+GOG_BIN = os.environ.get("MEETING_RECORDER_GOG_BIN", "gog").strip()
+# How long the calendar lookup may take before we give up and fall back to the
+# tab title, and how far outside an event's window still counts as "now" (people
+# join early / the recorder trips a little late).
+# Kept short: naming runs synchronously at record-start, so a hung lookup must
+# not delay ffmpeg by much. gog normally answers in ~1-2s; on timeout we just
+# fall back to the tab title.
+CALENDAR_TIMEOUT = int(os.environ.get("MEETING_RECORDER_CALENDAR_TIMEOUT", "6"))
+CALENDAR_START_GRACE_MIN = int(os.environ.get("MEETING_RECORDER_CALENDAR_START_GRACE_MIN", "10"))
+CALENDAR_END_GRACE_MIN = int(os.environ.get("MEETING_RECORDER_CALENDAR_END_GRACE_MIN", "5"))
 
 BROWSER_APPS = {
     "Google Chrome": "chrome",
@@ -299,11 +325,15 @@ def short_meeting_label(reason: str) -> str:
     low = reason.lower()
     for hint, name in (
         ("meet.google", "Google Meet"), ("google meet", "Google Meet"),
+        ("meet - ", "Google Meet"), ("meet – ", "Google Meet"), ("meet: ", "Google Meet"),
         ("zoom", "Zoom"), ("teams", "Microsoft Teams"),
         ("webex", "Webex"), ("whereby", "Whereby"),
     ):
         if hint in low:
             return name
+    # A bare Meet room code (abc-defg-hij) also means Google Meet.
+    if _MEET_CODE_RE.search(low):
+        return "Google Meet"
     # Fallback: the app name before the first colon.
     return reason.split(":", 1)[0].strip() or "Meeting"
 
@@ -488,6 +518,155 @@ def slug(value: str) -> str:
     return value[:80] or "meeting"
 
 
+# A Google Meet room code, e.g. "abc-defg-hij". These carry no meaning, so we
+# strip them from tab titles rather than name a recording after them.
+_MEET_CODE_RE = re.compile(r"\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b")
+# Platform chrome we peel off a tab title so what's left is the meeting's name.
+_TAB_NOISE_RE = re.compile(
+    r"""^\s*(?:\(\d+\)\s*)?          # unread badge like "(3) "
+        (?:meet(?:\s*[-–—:|]\s*)?    # "Meet - ", "Meet: ", "Meet – "
+          |google\s+meet
+          |zoom(?:\s+meeting)?
+          |microsoft\s+teams
+          |teams\s+meeting
+          |webex
+          |whereby)\s*[-–—:|]?\s*""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_TAB_TAIL_RE = re.compile(
+    r"""\s*[-–—|]\s*(?:google\s+meet|meet|zoom|microsoft\s+teams|teams|webex|whereby)\s*$""",
+    re.IGNORECASE,
+)
+
+
+def clean_tab_title(reason: str) -> str | None:
+    """Extract a human meeting name from a raw detection string.
+
+    `reason` is either "App: <tab title>" or a bare platform label. Strips the
+    app prefix, platform words, unread badges and Meet room codes. Returns the
+    remaining title, or None when nothing meaningful is left (so callers fall
+    back to a plain platform label).
+    """
+    title = reason.split(":", 1)[1].strip() if ":" in reason else reason.strip()
+    title = re.sub(r"^\(\d+\)\s*", "", title)  # unread badge like "(3) "
+    title = _MEET_CODE_RE.sub("", title)
+    # Peel leading/trailing platform chrome (may repeat, e.g. "Meet - Zoom").
+    for _ in range(3):
+        new = _TAB_TAIL_RE.sub("", _TAB_NOISE_RE.sub("", title)).strip(" -–—|:")
+        if new == title:
+            break
+        title = new
+    title = title.strip()
+    if len(title) < 2:
+        return None
+    return title
+
+
+def _meet_codes_open() -> set[str]:
+    """Meet room codes visible in any open browser tab right now."""
+    codes: set[str] = set()
+    try:
+        for _, url, title in browser_tabs():
+            codes.update(_MEET_CODE_RE.findall(f"{url} {title}".lower()))
+    except Exception:
+        pass
+    return codes
+
+
+def _parse_event_dt(node: dict, key: str) -> dt.datetime | None:
+    """Parse a timed event's start/end into an aware datetime.
+
+    Returns None for all-day events (only a "date", no "dateTime"): they carry
+    no useful meeting name and would spuriously overlap "now" all day.
+    """
+    slot = node.get(key) or {}
+    raw = slot.get("dateTime")
+    if raw:
+        try:
+            return dt.datetime.fromisoformat(raw).astimezone()
+        except ValueError:
+            return None
+    return None  # all-day events carry no meeting name we want
+
+
+def _fetch_calendar_events() -> list[dict]:
+    events: list[dict] = []
+    for pair in CALENDAR_ACCOUNTS.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        client, _, account = pair.partition("=")
+        cmd = [GOG_BIN, "calendar", "events", "--today", "--json", "--max", "30"]
+        if client.strip():
+            cmd += ["--client", client.strip()]
+        if account.strip():
+            cmd += ["-a", account.strip()]
+        try:
+            proc = run(cmd, timeout=CALENDAR_TIMEOUT)
+        except Exception as exc:
+            log(f"calendar lookup failed ({' '.join(cmd)}): {exc}")
+            continue
+        if proc.returncode != 0:
+            log(f"calendar lookup non-zero rc={proc.returncode}: {proc.stderr.strip()[:200]}")
+            continue
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            continue
+        events.extend(data.get("events", []) or [])
+    return events
+
+
+def calendar_meeting_title() -> str | None:
+    """Best-effort title of the calendar event happening right now.
+
+    Prefers a Google Meet event whose room code matches an open tab, then any
+    video event, then the most-recently-started event overlapping now. Returns
+    None on any miss (no gog, no network, nothing scheduled) so naming falls
+    back to the tab title.
+    """
+    if not CALENDAR_LOOKUP or not command_exists(GOG_BIN):
+        return None
+    now = dt.datetime.now().astimezone()
+    start_grace = dt.timedelta(minutes=CALENDAR_START_GRACE_MIN)
+    end_grace = dt.timedelta(minutes=CALENDAR_END_GRACE_MIN)
+    open_codes = _meet_codes_open()
+
+    best: tuple[int, dt.datetime, str] | None = None  # (score, start, summary)
+    for ev in _fetch_calendar_events():
+        summary = (ev.get("summary") or "").strip()
+        if not summary:
+            continue
+        start = _parse_event_dt(ev, "start")
+        end = _parse_event_dt(ev, "end")
+        if not start or not end:
+            continue
+        if not (start - start_grace <= now <= end + end_grace):
+            continue
+        hangout = ev.get("hangoutLink") or ""
+        code_match = any(code in hangout.lower() for code in open_codes)
+        score = 2 if code_match else (1 if hangout else 0)
+        candidate = (score, start, summary)
+        if best is None or (score, start) > (best[0], best[1]):
+            best = candidate
+    if best:
+        log(f"calendar match for recording name: {best[2]!r}")
+        return best[2]
+    return None
+
+
+def meeting_name(reason: str) -> str:
+    """The best human name for a recording of the meeting `reason` describes."""
+    try:
+        cal = calendar_meeting_title()
+    except Exception as exc:
+        log(f"calendar naming errored, falling back to tab title: {exc}")
+        cal = None
+    if cal:
+        return cal
+    return clean_tab_title(reason) or short_meeting_label(reason)
+
+
 def ensure_recorder_built() -> Path:
     """Compile recorder/main.swift into the sck-recorder helper if needed.
 
@@ -560,7 +739,7 @@ def _start_screencapturekit(reason: str, path: Path) -> subprocess.Popen[bytes] 
 def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
     ROOT.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = ROOT / f"{now}_{slug(reason)}.wav"
+    path = ROOT / f"{now}_{slug(meeting_name(reason))}.wav"
 
     if CAPTURE_BACKEND in ("auto", "screencapturekit", "sck"):
         proc = _start_screencapturekit(reason, path)
