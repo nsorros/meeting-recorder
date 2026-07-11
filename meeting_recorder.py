@@ -1325,11 +1325,32 @@ def install_notifier() -> int:
     return 0
 
 
+def launch_agent_path() -> str:
+    """Build a PATH for the LaunchAgent that works for any user.
+
+    launchd starts with a minimal PATH, so we seed the standard tool locations
+    (derived from the running user's home, not a hardcoded one) and then union in
+    the installing shell's PATH so custom tool locations — a non-standard
+    Homebrew prefix, pyenv/asdf/conda shims, etc. — survive."""
+    home = Path.home()
+    seed = [
+        "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        str(home / ".local" / "bin"), str(home / ".pyenv" / "shims"),
+    ]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for entry in seed + os.environ.get("PATH", "").split(os.pathsep):
+        if entry and entry not in seen:
+            seen.add(entry)
+            ordered.append(entry)
+    return os.pathsep.join(ordered)
+
+
 def install_launch_agent() -> Path:
     plist = LAUNCH_AGENT_PATH
     script = Path(__file__).resolve()
     env_vars = {
-        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/nsorros/.local/bin:/Users/nsorros/.pyenv/shims",
+        "PATH": launch_agent_path(),
         "MEETING_RECORDER_DIR": str(ROOT),
         "MEETING_RECORDER_LOG": str(LOG),
         "MEETING_RECORDER_WHISPER_MODEL": WHISPER_MODEL,
