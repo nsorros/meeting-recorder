@@ -206,17 +206,41 @@ It is installed as:
 
 The menu shows:
 
-- waveform `MR`: watcher state / idle
-- filled record circle `REC`: manual recording running
+- clock `Waiting`: watcher running, no meeting in progress
+- filled record circle `Rec <elapsed>`: a recording is running
+- `Transcribing…`: cleaning up the last meeting
+- waveform-slash `Off`: watcher stopped
+- the **last recording** and **last transcript**, each with their age and a one-click action to play / open them
 
 Menu actions:
 
 - start/stop the login watcher
 - start a manual recording
 - stop the manual recording and transcribe it
+- play the last recording / open the last transcript
 - open recordings
 - open logs
 - run doctor
+
+## Meeting Names
+
+Recordings are named after the meeting, best effort, in this order:
+
+1. **Calendar** — the Google Calendar event happening right now, via the `gog`
+   CLI. This gives the real human title (`Danil / Nick - 1 on 1`) instead of the
+   generic tab (`Meet - abc-defg-hij`). A video event whose Meet room code matches
+   an open tab wins; otherwise any event with a video link, otherwise the
+   most-recently-started event overlapping now (with a few minutes' grace so
+   joining early or tripping late still matches). Both of Nick's orgs (mantis +
+   finant) are consulted by default.
+2. **Tab title** — the browser tab title with platform noise, unread badges and
+   Meet room codes stripped (`Weekly Sync | Google Meet` → `Weekly Sync`).
+3. **Platform label** — `Google Meet` / `Zoom` / … when nothing better is known.
+
+The lookup is best effort and never blocks recording for long: if `gog` is
+missing, offline, or slow (past `MEETING_RECORDER_CALENDAR_TIMEOUT`), it silently
+falls back to the tab title. Set `MEETING_RECORDER_CALENDAR=0` to skip the
+calendar step entirely.
 
 ## Configuration
 
@@ -248,6 +272,11 @@ Environment variables:
 - `MEETING_RECORDER_DISABLE_CLAUDE`: set to `1` to skip Claude cleanup.
 - `MEETING_RECORDER_CLAUDE_MODEL`: optional Claude model alias.
 - `MEETING_RECORDER_DIARIZE`: set to `1` to enable acoustic speaker diarization via whisperx (needs whisperx + `HF_TOKEN`). See **Speaker Labels**.
+- `MEETING_RECORDER_CALENDAR`: set to `0` to skip the calendar lookup when naming a recording (see **Meeting Names**). Default: `1`.
+- `MEETING_RECORDER_CALENDAR_ACCOUNTS`: comma-separated `client=account` pairs passed to `gog` for the calendar lookup (either side may be blank for gog's default). Default: `=,finant=nick@finant.ai` (mantis + finant).
+- `MEETING_RECORDER_CALENDAR_TIMEOUT`: seconds each calendar query may take before falling back to the tab title. Default: `6`.
+- `MEETING_RECORDER_CALENDAR_START_GRACE_MIN` / `MEETING_RECORDER_CALENDAR_END_GRACE_MIN`: minutes of slack before an event starts / after it ends that still count as "now". Defaults: `10` / `5`.
+- `MEETING_RECORDER_GOG_BIN`: path to the `gog` CLI used for the calendar lookup. Default: `gog`.
 - `MEETING_RECORDER_POLL_SECONDS`: meeting detection interval. Default: `10`.
 - `MEETING_RECORDER_END_GRACE_SECONDS`: time to wait after meeting disappears before stopping. Default: `45`.
 - `MEETING_RECORDER_CHECK_IN_SECONDS`: while recording, ask whether to keep going after this many seconds. Default: `1800` (30 minutes). Set to `0` to disable. Dismissing or ignoring this prompt now **keeps recording** — only clicking "Stop and transcribe" stops it, so an unanswered check-in can no longer cut a meeting short.

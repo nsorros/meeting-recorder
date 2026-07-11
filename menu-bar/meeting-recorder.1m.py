@@ -72,6 +72,32 @@ def watcher_status() -> dict[str, str]:
     return state
 
 
+def _age(mtime: float) -> str:
+    secs = int(time.time() - mtime)
+    if secs < 3600:
+        return f"{max(secs // 60, 0)}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def latest_recording() -> Path | None:
+    """Newest recorded audio file, or None."""
+    if not RECORDINGS.exists():
+        return None
+    files = [p for p in RECORDINGS.glob("*.wav") if p.is_file()]
+    files += [p for p in RECORDINGS.glob("*.m4a") if p.is_file()]
+    return max(files, key=lambda p: p.stat().st_mtime, default=None)
+
+
+def latest_transcript() -> Path | None:
+    """Newest cleaned meeting transcript (<stem>.meeting.md), or None."""
+    if not RECORDINGS.exists():
+        return None
+    md = [p for p in RECORDINGS.glob("*/*.meeting.md") if p.is_file()]
+    return max(md, key=lambda p: p.stat().st_mtime, default=None)
+
+
 def elapsed(since: str) -> str:
     try:
         secs = int(time.time()) - int(since)
@@ -114,7 +140,7 @@ def main() -> None:
     elif state == "transcribing":
         menu_title("Transcribing…", "ellipsis.circle")
     elif watcher:
-        menu_title("Listening", "ear")
+        menu_title("Waiting", "clock")
     else:
         menu_title("Off", "waveform.slash")
 
@@ -125,7 +151,7 @@ def main() -> None:
     elif state == "transcribing":
         print("⏳ Transcribing last meeting…")
     elif watcher:
-        print("👂 Listening for meetings")
+        print("🕐 Waiting for a meeting")
     print(f"Watcher: {'running' if watcher else 'stopped'}")
     if watcher:
         item("Stop watcher", str(MREC), "stop")
@@ -144,6 +170,16 @@ def main() -> None:
         item("Start manual recording", str(MREC), "record-start", "menubar-manual")
 
     print("---")
+    last_rec = latest_recording()
+    last_tx = latest_transcript()
+    if last_rec or last_tx:
+        if last_rec:
+            print(f"Last recording: {last_rec.stem}  ({_age(last_rec.stat().st_mtime)})")
+            item("▸ Play recording", "/usr/bin/open", str(last_rec), refresh=False)
+        if last_tx:
+            print(f"Last transcript: {last_tx.parent.name}  ({_age(last_tx.stat().st_mtime)})")
+            item("▸ Open transcript", "/usr/bin/open", str(last_tx), refresh=False)
+        print("---")
     item("Open recordings folder", "/usr/bin/open", str(RECORDINGS), refresh=False)
     item("Open log", "/usr/bin/open", str(LOG), refresh=False)
     item("Run doctor in Terminal", str(MREC), "doctor", refresh=False, terminal=True)
