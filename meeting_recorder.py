@@ -35,6 +35,11 @@ LAUNCH_AGENT_LABEL = "com.nsorros.meeting-recorder"
 LAUNCH_AGENT_PATH = Path(f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist").expanduser()
 STATE_DIR = Path(os.environ.get("MEETING_RECORDER_STATE_DIR", "~/.local/state/meeting-recorder")).expanduser()
 MANUAL_PID_FILE = STATE_DIR / "manual-recording.pid"
+# Cross-process guard against overlapping recordings. Written the moment ANY
+# recording starts (watcher or manual) and cleared on stop, so the two never run
+# concurrent capture streams — two ScreenCaptureKit sessions interrupt one
+# another (stopping one kills the other's stream), truncating a meeting.
+RECORDING_LOCK = STATE_DIR / "recording.lock"
 # Published so the menu bar can show a real state (recording / transcribing /
 # watching) instead of a static label. Written by the watcher, read by the plugin.
 WATCHER_STATUS_FILE = STATE_DIR / "watcher-status"
@@ -251,6 +256,63 @@ def read_manual_state() -> dict[str, str] | None:
         return None
     if not pid_is_running(pid):
         MANUAL_PID_FILE.unlink(missing_ok=True)
+        return None
+    return state
+
+
+def write_recording_lock(audio: Path, backend: str) -> None:
+    """Mark that this process is actively capturing, so no other meeting-recorder
+    process starts an overlapping stream."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        RECORDING_LOCK.write_text(
+            f"pid={os.getpid()}\naudio={audio}\nbackend={backend}\n"
+            f"started_at={dt.datetime.now().isoformat(timespec='seconds')}\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        log(f"could not write recording lock: {exc}")
+
+
+def read_recording_lock() -> dict[str, str] | None:
+    """Return the live recording lock (pid/audio/backend), clearing it if stale."""
+    if not RECORDING_LOCK.exists():
+        return None
+    state: dict[str, str] = {}
+    for line in RECORDING_LOCK.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            state[key] = value
+    try:
+        pid = int(state.get("pid", ""))
+    except ValueError:
+        RECORDING_LOCK.unlink(missing_ok=True)
+        return None
+    if not pid_is_running(pid):
+        RECORDING_LOCK.unlink(missing_ok=True)
+        return None
+    return state
+
+
+def clear_recording_lock() -> None:
+    """Release the lock, but only if we own it — a recorder that crashed and was
+    replaced by a new one must not wipe the new holder's lock."""
+    try:
+        state = read_recording_lock()
+        if state is None or state.get("pid") == str(os.getpid()):
+            RECORDING_LOCK.unlink(missing_ok=True)
+    except Exception as exc:
+        log(f"could not clear recording lock: {exc}")
+
+
+def recording_in_progress(exclude_self: bool = True) -> dict[str, str] | None:
+    """Return a live recording held by another process, or None. Lets the watcher
+    and manual recordings yield to one another instead of starting overlapping
+    capture streams that would interrupt each other."""
+    state = read_recording_lock()
+    if not state:
+        return None
+    if exclude_self and state.get("pid") == str(os.getpid()):
         return None
     return state
 
@@ -741,18 +803,22 @@ def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
     now = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     path = ROOT / f"{now}_{slug(meeting_name(reason))}.wav"
 
+    proc: subprocess.Popen[bytes] | None = None
     if CAPTURE_BACKEND in ("auto", "screencapturekit", "sck"):
         proc = _start_screencapturekit(reason, path)
-        if proc is not None:
-            return proc, path
-        if CAPTURE_BACKEND != "auto":
-            raise RuntimeError(
-                "ScreenCaptureKit backend unavailable (build failed or Screen Recording "
-                "permission not granted); see the log. Run 'mrec doctor' for details."
-            )
-        log("ScreenCaptureKit unavailable; falling back to ffmpeg/avfoundation loopback capture")
+        if proc is None:
+            if CAPTURE_BACKEND != "auto":
+                raise RuntimeError(
+                    "ScreenCaptureKit backend unavailable (build failed or Screen Recording "
+                    "permission not granted); see the log. Run 'mrec doctor' for details."
+                )
+            log("ScreenCaptureKit unavailable; falling back to ffmpeg/avfoundation loopback capture")
 
-    return _start_ffmpeg(reason, path), path
+    if proc is None:
+        proc = _start_ffmpeg(reason, path)
+
+    write_recording_lock(path, getattr(proc, "mr_backend", "ffmpeg"))
+    return proc, path
 
 
 def _start_ffmpeg(reason: str, path: Path) -> subprocess.Popen[bytes]:
@@ -788,23 +854,26 @@ def _start_ffmpeg(reason: str, path: Path) -> subprocess.Popen[bytes]:
 
 
 def stop_recording(proc: subprocess.Popen[bytes]) -> None:
-    if getattr(proc, "mr_backend", "ffmpeg") == "screencapturekit":
-        _stop_screencapturekit(proc)
-        return
-    if proc.poll() is not None:
-        return
     try:
-        log("stopping recording")
-        if proc.stdin:
-            proc.stdin.write(b"q\n")
-            proc.stdin.flush()
-        proc.wait(timeout=12)
-    except Exception:
-        proc.terminate()
+        if getattr(proc, "mr_backend", "ffmpeg") == "screencapturekit":
+            _stop_screencapturekit(proc)
+            return
+        if proc.poll() is not None:
+            return
         try:
-            proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            log("stopping recording")
+            if proc.stdin:
+                proc.stdin.write(b"q\n")
+                proc.stdin.flush()
+            proc.wait(timeout=12)
+        except Exception:
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        clear_recording_lock()
 
 
 def _stop_screencapturekit(proc: subprocess.Popen[bytes]) -> None:
@@ -976,13 +1045,19 @@ def openrouter_api_key() -> str:
         if val:
             return val
     if OPENROUTER_ENV_FILE:
+        env_path = Path(OPENROUTER_ENV_FILE).expanduser()
         try:
-            for line in Path(OPENROUTER_ENV_FILE).expanduser().read_text(encoding="utf-8").splitlines():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line.startswith("OPENROUTER_API_KEY="):
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except Exception:
-            pass
+            # File read fine but held no key line — say so rather than falling
+            # back to Whisper with a bare "no key" message.
+            log(f"openrouter: env file {display_path(env_path)} has no OPENROUTER_API_KEY= line")
+        except Exception as exc:
+            log(f"openrouter: could not read env file {display_path(env_path)} ({exc})")
+    else:
+        log("openrouter: no key in environment and MEETING_RECORDER_OPENROUTER_ENV_FILE is unset")
     return ""
 
 
@@ -1210,6 +1285,15 @@ def watch() -> None:
         if declined_reason == reason:
             time.sleep(POLL_SECONDS)
             continue
+        busy = recording_in_progress()
+        if busy:
+            # A manual (or other) recording is already capturing. Starting a
+            # second ScreenCaptureKit stream here would interrupt it, so yield
+            # this meeting to the active recorder and stay quiet until it clears.
+            log(f"another recording already active (pid {busy.get('pid')}, {busy.get('audio')}); not starting a second capture")
+            declined_reason = reason
+            time.sleep(POLL_SECONDS)
+            continue
         if not ask_to_record(reason):
             declined_reason = reason
             notify("Meeting Recorder", "Okay, I will ignore this meeting until it disappears.")
@@ -1226,6 +1310,20 @@ def watch() -> None:
             last_seen = time.time()
             last_check_in = time.time()
             while True:
+                if proc.poll() is not None:
+                    # The capture helper exited on its own — a ScreenCaptureKit
+                    # stream interruption or crash. It looks like a clean stop
+                    # (exit 0) but the audio is truncated at that point. Catch it
+                    # within one poll instead of "recording" nothing for an hour.
+                    log(f"recorder helper exited mid-recording (rc={proc.returncode}); capture interrupted, audio is truncated")
+                    alert(
+                        "Meeting recording interrupted",
+                        "The capture stream stopped early — the saved audio is likely "
+                        "truncated. See the .sck.log next to the recording; you may need "
+                        "to re-record. (Often caused by another recording starting at the "
+                        "same time.)",
+                    )
+                    break
                 current = detect_meeting()
                 if current:
                     last_seen = time.time()
@@ -1317,6 +1415,14 @@ def record_daemon(label: str) -> int:
     notify("Meeting Recorder", f"Manual recording started: {label}")
     try:
         while not stop_requested:
+            if proc.poll() is not None:
+                log(f"manual recorder helper exited mid-recording (rc={proc.returncode}); capture interrupted, audio is truncated")
+                alert(
+                    "Meeting recording interrupted",
+                    "The capture stream stopped early — the saved audio is likely "
+                    "truncated. See the .sck.log next to the recording.",
+                )
+                break
             time.sleep(1)
     finally:
         stop_recording(proc)
@@ -1340,6 +1446,16 @@ def manual_recording_start(label: str) -> int:
     state = read_manual_state()
     if state:
         print(f"Manual recording already running: pid {state.get('pid')} ({state.get('label', 'manual')})")
+        return 0
+    busy = recording_in_progress()
+    if busy:
+        # The watcher (or another process) is already recording. A second stream
+        # would interrupt it — refuse instead of starting overlapping capture.
+        print(
+            f"A recording is already in progress (pid {busy.get('pid')}, "
+            f"{display_path(Path(busy['audio'])) if busy.get('audio') else 'unknown'}). "
+            "Not starting a second one."
+        )
         return 0
     log_file = LOG.open("a", encoding="utf-8")
     cmd = [sys.executable, str(Path(__file__).resolve()), "record-daemon", label]
