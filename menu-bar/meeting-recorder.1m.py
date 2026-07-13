@@ -153,6 +153,12 @@ def main() -> None:
     elif watcher:
         print("🕐 Waiting for a meeting")
     print(f"Watcher: {'running' if watcher else 'stopped'}")
+
+    # Stop whatever is recording (auto or manual) — the primary action when live.
+    if manual or state == "recording":
+        item("⏹ Stop recording and transcribe", str(MREC), "stop-recording")
+
+    print("---")
     if watcher:
         item("Stop watcher", str(MREC), "stop")
     else:
@@ -164,7 +170,6 @@ def main() -> None:
         print(f"Started: {manual.get('started_at', 'unknown')}")
         if manual.get("audio"):
             print(f"Audio: {manual['audio']}")
-        item("Stop manual recording and transcribe", str(MREC), "record-stop")
     else:
         print("Manual recording: stopped")
         item("Start manual recording", str(MREC), "record-start", "menubar-manual")
