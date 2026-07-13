@@ -55,6 +55,10 @@ NOTIFIER_BUNDLE_ID = "com.nsorros.meeting-recorder"
 NOTIFIER_SRC = Path(__file__).resolve().parent / "notifier" / "main.swift"
 NOTIFIER_APP = Path("~/Applications/Meeting Recorder Notifier.app").expanduser()
 NOTIFIER_BIN = NOTIFIER_APP / "Contents" / "MacOS" / "notifier"
+# The same mic logo the notifier posts with. osascript dialogs/alerts otherwise
+# show the generic script icon; pointing `display dialog ... with icon` at this
+# gives the prompts the branded look the notifications already have.
+NOTIFIER_ICON = NOTIFIER_APP / "Contents" / "Resources" / "AppIcon.icns"
 USE_LOGO = os.environ.get("MEETING_RECORDER_NO_LOGO", "").lower() not in {"1", "true", "yes"}
 AUDIO_DEVICE = os.environ.get("MEETING_RECORDER_AUDIO_DEVICE", "").strip()
 # Capture sample rate for the output WAV. The bare built-in mic sometimes gets
@@ -364,15 +368,27 @@ def notify(title: str, text: str) -> None:
         log(f"notification failed: {exc}")
 
 
+def _icon_clause() -> str:
+    """AppleScript `with icon` clause pointing at the mic logo, or empty if the
+    notifier app (which holds the icon) hasn't been built yet."""
+    if USE_LOGO and NOTIFIER_ICON.exists():
+        return " with icon POSIX file " + applescript_quote(str(NOTIFIER_ICON))
+    return ""
+
+
 def alert(title: str, text: str) -> None:
+    # A dialog (not `display alert`) so we can carry the mic logo — display alert
+    # can't take a custom icon. Title becomes the window title; the body stays
+    # short. Auto-dismisses so a headless daemon never hangs on it.
     try:
         osascript(
-            "display alert "
-            + applescript_quote(title)
-            + " message "
+            "display dialog "
             + applescript_quote(text)
-            + ' as informational buttons {"OK"} default button "OK"',
-            timeout=20,
+            + ' buttons {"OK"} default button "OK" with title '
+            + applescript_quote(title)
+            + _icon_clause()
+            + " giving up after 30",
+            timeout=35,
         )
     except Exception as exc:
         log(f"alert failed: {exc}")
@@ -380,6 +396,15 @@ def alert(title: str, text: str) -> None:
 
 def applescript_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def recording_display_name(audio: Path) -> str:
+    """A short, human name for a recording, taken from its filename
+    (`<date>_<time>_<slug>.wav` → 'slug words'). Used in the check-in prompt so
+    it shows the meeting's actual name instead of the raw detection string."""
+    parts = audio.stem.split("_", 2)
+    name = (parts[2] if len(parts) == 3 else audio.stem).replace("-", " ").replace("_", " ").strip()
+    return name or "this meeting"
 
 
 def short_meeting_label(reason: str) -> str:
@@ -406,7 +431,9 @@ def ask_to_record(reason: str) -> bool:
         "display dialog "
         + applescript_quote(message)
         + ' buttons {"Dismiss", "Record"} default button "Record" '
-          'cancel button "Dismiss" with title "Meeting Recorder" giving up after 30'
+          'cancel button "Dismiss" with title "Meeting Recorder"'
+        + _icon_clause()
+        + " giving up after 30"
     )
     log_section("meeting detected", reason=reason)
     try:
@@ -420,11 +447,7 @@ def ask_to_record(reason: str) -> bool:
 
 
 def ask_continue_recording(reason: str, audio: Path) -> bool:
-    message = (
-        f"I am still recording this meeting:\n\n{reason}\n\n"
-        f"Audio file:\n{display_path(audio)}\n\n"
-        "Should I keep recording?"
-    )
+    message = f"Still recording “{recording_display_name(audio)}”.\n\nKeep recording?"
     # No cancel button and any dialog failure defaults to KEEP recording: a
     # dismissed or timed-out check-in must never silently end a live meeting.
     # Only an explicit "Stop and transcribe" click stops.
@@ -432,7 +455,9 @@ def ask_continue_recording(reason: str, audio: Path) -> bool:
         "display dialog "
         + applescript_quote(message)
         + ' buttons {"Stop and transcribe", "Keep recording"} default button "Keep recording" '
-          'with title "Meeting Recorder" giving up after 60'
+          'with title "Meeting Recorder"'
+        + _icon_clause()
+        + " giving up after 60"
     )
     log_section("recording check-in", reason=reason, audio_file=display_path(audio))
     try:
