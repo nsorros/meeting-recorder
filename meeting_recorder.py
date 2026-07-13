@@ -40,6 +40,10 @@ MANUAL_PID_FILE = STATE_DIR / "manual-recording.pid"
 # concurrent capture streams — two ScreenCaptureKit sessions interrupt one
 # another (stopping one kills the other's stream), truncating a meeting.
 RECORDING_LOCK = STATE_DIR / "recording.lock"
+# Touched by `mrec stop-recording` (e.g. from the menu bar) to ask the watcher to
+# stop the current auto-recording on demand and transcribe it — the only way to
+# end a watcher recording early without closing the meeting tab or the daemon.
+STOP_REQUEST_FILE = STATE_DIR / "stop-request"
 # Published so the menu bar can show a real state (recording / transcribing /
 # watching) instead of a static label. Written by the watcher, read by the plugin.
 WATCHER_STATUS_FILE = STATE_DIR / "watcher-status"
@@ -319,6 +323,29 @@ def recording_in_progress(exclude_self: bool = True) -> dict[str, str] | None:
     if exclude_self and state.get("pid") == str(os.getpid()):
         return None
     return state
+
+
+def request_watcher_stop() -> None:
+    """Ask the watcher to stop its current recording (checked each poll)."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STOP_REQUEST_FILE.write_text(f"requested_at={int(time.time())}\n", encoding="utf-8")
+    except Exception as exc:
+        log(f"could not write stop request: {exc}")
+
+
+def stop_requested() -> bool:
+    """True (and consumes the request) if a stop of the current recording was
+    asked for since it started."""
+    if not STOP_REQUEST_FILE.exists():
+        return False
+    STOP_REQUEST_FILE.unlink(missing_ok=True)
+    return True
+
+
+def clear_stop_request() -> None:
+    """Drop any leftover request so it can't stop the *next* recording early."""
+    STOP_REQUEST_FILE.unlink(missing_ok=True)
 
 
 def osascript(script: str, timeout: int = 20) -> str:
@@ -1330,11 +1357,15 @@ def watch() -> None:
         audio: Path | None = None
         try:
             proc, audio = start_recording(reason)
+            clear_stop_request()  # ignore any stale request from a prior recording
             write_watcher_status("recording", short_meeting_label(reason))
             notify("Meeting Recorder", f"Recording {short_meeting_label(reason)}.")
             last_seen = time.time()
             last_check_in = time.time()
             while True:
+                if stop_requested():
+                    log("stop requested (mrec stop-recording); stopping and transcribing")
+                    break
                 if proc.poll() is not None:
                     # The capture helper exited on its own — a ScreenCaptureKit
                     # stream interruption or crash. It looks like a clean stop
@@ -1498,6 +1529,26 @@ def manual_recording_stop() -> int:
     pid = int(state["pid"])
     os.kill(pid, signal.SIGTERM)
     print(f"Stopping manual recording pid {pid}. It will transcribe after the audio finalizes.")
+    return 0
+
+
+def stop_recording_command() -> int:
+    """Stop whichever recording is currently running — a manual one or the
+    watcher's auto-recording — and let it transcribe. This is what the menu bar's
+    'Stop recording' calls, so an auto-recording can be ended without closing the
+    meeting tab or the whole watcher."""
+    manual = read_manual_state()
+    if manual:
+        os.kill(int(manual["pid"]), signal.SIGTERM)
+        print(f"Stopping manual recording pid {manual['pid']}. It will transcribe after the audio finalizes.")
+        return 0
+    lock = read_recording_lock()
+    if lock:
+        request_watcher_stop()
+        name = recording_display_name(Path(lock["audio"])) if lock.get("audio") else "the meeting"
+        print(f"Stopping “{name}”. It will transcribe after the audio finalizes.")
+        return 0
+    print("No recording is in progress.")
     return 0
 
 
@@ -1803,6 +1854,7 @@ def main() -> int:
     manual_start = sub.add_parser("record-start", help="start a manual background recording")
     manual_start.add_argument("label", nargs="?", default="manual-meeting")
     sub.add_parser("record-stop", help="stop the manual background recording and transcribe it")
+    sub.add_parser("stop-recording", help="stop the current recording (manual OR watcher) and transcribe it")
     daemon = sub.add_parser("record-daemon", help=argparse.SUPPRESS)
     daemon.add_argument("label", nargs="?", default="manual-meeting")
     args = parser.parse_args()
@@ -1835,6 +1887,8 @@ def main() -> int:
         return manual_recording_start(args.label)
     if args.command == "record-stop":
         return manual_recording_stop()
+    if args.command == "stop-recording":
+        return stop_recording_command()
     if args.command == "record-daemon":
         return record_daemon(args.label)
     raise AssertionError(args.command)
