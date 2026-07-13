@@ -199,11 +199,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        // The stream died on its own (e.g. another capture session interrupted
+        // ours). Exit non-zero so the Python driver can tell this truncated
+        // recording apart from a clean SIGINT stop, which exits 0.
         emit("stream stopped with error: \(error.localizedDescription)")
-        stop()
+        stop(code: 7)
     }
 
-    func stop() {
+    func stop(code: Int32 = 0) {
         writeQueue.async { [weak self] in
             guard let self = self, !self.stopped else { return }
             self.stopped = true
@@ -214,7 +217,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.systemFile = nil
                     self.micFile = nil
                     emit("stopped (system frames=\(self.systemFrames), mic frames=\(self.micFrames))")
-                    exit(0)
+                    exit(code)
                 }
             }
             if let stream = self.stream {
