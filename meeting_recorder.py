@@ -53,6 +53,13 @@ CREDITS_CACHE = STATE_DIR / "openrouter-credits.json"
 # Transcripts rendered to HTML for reading in the browser. Derived output, kept
 # out of the recording folders so those stay source-only.
 RENDERED_DIR = STATE_DIR / "rendered"
+# OpenRouter settings persisted by `mrec start`. The daemon gets these from its
+# launchd plist, but nothing else does: the xbar menu bar and a plain shell
+# inherit neither, so they used to resolve no key and report a *false* "no
+# OpenRouter API key" — indistinguishable from a real credit/key failure. Written
+# here so every process reads the same settings. Holds the env-file path, never
+# the key itself (see openrouter_api_key()).
+CONFIG_FILE = STATE_DIR / "config.json"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 # Notification logo: osascript notifications are locked to the generic script
 # icon, so when terminal-notifier is installed we route through it with -appIcon
@@ -117,6 +124,35 @@ WHISPER_NO_SPEECH_THRESHOLD = os.environ.get("MEETING_RECORDER_NO_SPEECH_THRESHO
 WHISPER_HALLUCINATION_SILENCE_THRESHOLD = os.environ.get("MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD", "2").strip()
 CLAUDE_MODEL = os.environ.get("MEETING_RECORDER_CLAUDE_MODEL", "")
 DISABLE_CLAUDE = os.environ.get("MEETING_RECORDER_DISABLE_CLAUDE", "").lower() in {"1", "true", "yes"}
+
+
+def _persisted_config() -> dict:
+    """OpenRouter settings written by `mrec start`; empty when absent."""
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+_CONFIG = _persisted_config()
+
+
+def _setting(env_var: str, key: str, default: str = "") -> str:
+    """Environment first, then what `mrec start` persisted, then the default."""
+    return os.environ.get(env_var, "").strip() or str(_CONFIG.get(key) or "").strip() or default
+
+
+def write_persisted_config() -> None:
+    """Publish the resolved OpenRouter settings for processes without the plist."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps({
+        "transcribe_engine": TRANSCRIBE_ENGINE,
+        "openrouter_model": OPENROUTER_MODEL,
+        "openrouter_env_file": str(Path(OPENROUTER_ENV_FILE).expanduser()) if OPENROUTER_ENV_FILE else "",
+    }, indent=2) + "\n", encoding="utf-8")
+
+
 # --- Transcription engine ------------------------------------------------
 # "openrouter" (default): transcode to 16 kHz mono mp3 and transcribe via an
 # OpenRouter audio-capable model (Gemini Flash by default) — seconds per file
@@ -124,12 +160,12 @@ DISABLE_CLAUDE = os.environ.get("MEETING_RECORDER_DISABLE_CLAUDE", "").lower() i
 # back automatically to local Whisper when there is no API key, no network, no
 # credits (HTTP 401/402/403), or any request error. Set to "whisper" to force
 # local-only.
-TRANSCRIBE_ENGINE = os.environ.get("MEETING_RECORDER_TRANSCRIBE_ENGINE", "openrouter").strip().lower()
+TRANSCRIBE_ENGINE = _setting("MEETING_RECORDER_TRANSCRIBE_ENGINE", "transcribe_engine", "openrouter").lower()
 OPENROUTER_BASE_URL = os.environ.get(
     "MEETING_RECORDER_OPENROUTER_BASE_URL",
     os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
 ).strip()
-OPENROUTER_MODEL = os.environ.get("MEETING_RECORDER_OPENROUTER_MODEL", "google/gemini-2.5-flash").strip()
+OPENROUTER_MODEL = _setting("MEETING_RECORDER_OPENROUTER_MODEL", "openrouter_model", "google/gemini-2.5-flash")
 # Audio is chunked into segments this many seconds long so request bodies stay
 # small (Gemini bills ~25 audio tokens/sec; 600s ≈ 15k tokens, ~2.4 MB mp3).
 OPENROUTER_CHUNK_SECONDS = int(os.environ.get("MEETING_RECORDER_OPENROUTER_CHUNK_SECONDS", "600"))
@@ -142,7 +178,7 @@ OPENROUTER_PROMPT = os.environ.get(
 )
 # Optional dotenv-style file to read OPENROUTER_API_KEY from when it is not in
 # the environment (e.g. the ant app's ~/code/ant/.env). Only the key line is read.
-OPENROUTER_ENV_FILE = os.environ.get("MEETING_RECORDER_OPENROUTER_ENV_FILE", "").strip()
+OPENROUTER_ENV_FILE = _setting("MEETING_RECORDER_OPENROUTER_ENV_FILE", "openrouter_env_file")
 OPENROUTER_CREDITS_TIMEOUT = int(os.environ.get("MEETING_RECORDER_OPENROUTER_CREDITS_TIMEOUT", "10"))
 # Once the balance hits zero OpenRouter answers 402 and every transcription
 # silently downgrades to local Whisper, so warn while there is still time to top
@@ -1434,6 +1470,11 @@ def watch() -> None:
     notify("Meeting Recorder", "Watching for Meet, Zoom, Teams, Webex, and Whereby.")
     active = False
     declined_reason: str | None = None
+    # The daemon is the process that holds the real OpenRouter settings (launchd
+    # hands it the plist environment). Publish them on every start so the menu bar
+    # reports what the daemon will actually do instead of guessing from its own
+    # empty environment — and so this self-heals without a `mrec start`.
+    write_persisted_config()
     write_watcher_status("watching")
     while True:
         reason = detect_meeting()
@@ -2108,6 +2149,10 @@ def install_launch_agent() -> Path:
         env_vars["MEETING_RECORDER_OPENROUTER_ENV_FILE"] = str(Path(OPENROUTER_ENV_FILE).expanduser())
     if OPENROUTER_MODEL:
         env_vars["MEETING_RECORDER_OPENROUTER_MODEL"] = OPENROUTER_MODEL
+    # Same settings on disk for everyone who does not inherit the plist (the menu
+    # bar, a plain shell). Written from the same values in the same place so the
+    # two cannot drift.
+    write_persisted_config()
 
     env_xml = "\n".join(
         f"    <key>{escape(key)}</key>\n    <string>{escape(value)}</string>"
