@@ -70,6 +70,12 @@ them. Without it the menu bar resolved no key and cried `no OpenRouter API key`
 while the daemon was happily transcribing on Gemini. An env var always wins over
 the file; the key is never written there either.
 
+The same file records the daemon's `PATH`, for the same reason. SwiftBar and xbar
+launch their plugins with a bare `/usr/bin:/bin:/usr/sbin:/sbin` that misses
+Homebrew, so `ffmpeg` looks missing and the engine check predicts Whisper — again
+while the daemon is doing nothing of the sort. The recorded PATH is appended to
+(never allowed to override) the running process's own.
+
 ### Which engine will actually run
 
 Because the fallback is silent, a dead API key or an empty balance shows up only
