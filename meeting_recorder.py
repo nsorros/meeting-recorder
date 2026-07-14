@@ -150,7 +150,31 @@ def write_persisted_config() -> None:
         "transcribe_engine": TRANSCRIBE_ENGINE,
         "openrouter_model": OPENROUTER_MODEL,
         "openrouter_env_file": str(Path(OPENROUTER_ENV_FILE).expanduser()) if OPENROUTER_ENV_FILE else "",
+        # The daemon's PATH reaches ffmpeg; a GUI-launched process's does not.
+        # See _augment_path_from_config().
+        "path": os.environ.get("PATH", ""),
     }, indent=2) + "\n", encoding="utf-8")
+
+
+def _augment_path_from_config() -> None:
+    """Fold the daemon's recorded PATH into ours, for finding ffmpeg.
+
+    SwiftBar/xbar launch plugins with a bare `/usr/bin:/bin:/usr/sbin:/sbin`,
+    which misses Homebrew — so ffmpeg looks absent and transcription_plan()
+    predicts Whisper while the daemon, whose plist PATH does include Homebrew,
+    transcribes on OpenRouter perfectly well. Appended, never prepended: our own
+    PATH keeps priority, we only add places we would not otherwise look.
+    """
+    recorded = str(_CONFIG.get("path") or "").strip()
+    if not recorded:
+        return
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    os.environ["PATH"] = os.pathsep.join(
+        current + [p for p in recorded.split(os.pathsep) if p and p not in current]
+    )
+
+
+_augment_path_from_config()
 
 
 # --- Transcription engine ------------------------------------------------
