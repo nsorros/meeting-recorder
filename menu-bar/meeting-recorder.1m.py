@@ -140,7 +140,7 @@ def main() -> None:
     elif state == "transcribing":
         menu_title("Transcribing…", "ellipsis.circle")
     elif watcher:
-        menu_title("Waiting", "clock")
+        menu_title("Listening", "waveform")
     else:
         menu_title("Off", "waveform.slash")
 
@@ -151,7 +151,7 @@ def main() -> None:
     elif state == "transcribing":
         print("⏳ Transcribing last meeting…")
     elif watcher:
-        print("🕐 Waiting for a meeting")
+        print("🎧 Listening for a meeting")
     print(f"Watcher: {'running' if watcher else 'stopped'}")
 
     # Stop whatever is recording (auto or manual) — the primary action when live.
