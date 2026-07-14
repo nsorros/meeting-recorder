@@ -62,6 +62,14 @@ before running it (and run it again after changing them). The **key itself is ne
 written to the plist** — that file is world-readable, so point at an env file
 instead.
 
+The plist only reaches the daemon, though, and the menu bar is a separate process
+that inherits nothing. So those same three settings are also mirrored to
+`~/.local/state/meeting-recorder/config.json` — written by `mrec start` and by the
+watcher on every startup — and read back whenever the environment does not supply
+them. Without it the menu bar resolved no key and cried `no OpenRouter API key`
+while the daemon was happily transcribing on Gemini. An env var always wins over
+the file; the key is never written there either.
+
 ### Which engine will actually run
 
 Because the fallback is silent, a dead API key or an empty balance shows up only
