@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -110,6 +111,40 @@ def elapsed(since: str) -> str:
     return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
 
 
+def engine_plan() -> dict:
+    """Which engine the next transcription will use, per `mrec engine`.
+
+    Passes --max-age so this once-a-minute plugin reads a cached balance instead
+    of calling the API every refresh. Best-effort: on any failure the menu simply
+    omits the line rather than breaking.
+    """
+    try:
+        proc = subprocess.run([str(MREC), "engine", "--json", "--max-age", "900"],
+                              text=True, capture_output=True, timeout=20)
+        return json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except Exception:
+        return {}
+
+
+def print_engine_section() -> None:
+    plan = engine_plan()
+    if not plan:
+        return
+    model = plan.get("model", "")
+    if plan.get("engine") == "openrouter":
+        label = model.split("/")[-1]
+    else:
+        label = f"local whisper ({model})"
+    line = f"Transcribes with: {label}"
+    credits = plan.get("credits")
+    if credits:
+        line += f"  ·  ${credits['remaining']:.2f} left"
+    # "|" would be read as the start of xbar's parameter list.
+    print(line.replace("|", "/"))
+    if plan.get("warning"):
+        print(f"⚠️ {plan.get('reason', 'check engine')}".replace("|", "/") + " | color=red")
+
+
 def menu_title(text: str, sfimage: str, color: str | None = None) -> None:
     line = f"{text} | sfimage={sfimage}"
     if color:
@@ -153,6 +188,7 @@ def main() -> None:
     elif watcher:
         print("🕐 Waiting for a meeting")
     print(f"Watcher: {'running' if watcher else 'stopped'}")
+    print_engine_section()
 
     # Stop whatever is recording (auto or manual) — the primary action when live.
     if manual or state == "recording":
@@ -183,7 +219,9 @@ def main() -> None:
             item("▸ Play recording", "/usr/bin/open", str(last_rec), refresh=False)
         if last_tx:
             print(f"Last transcript: {last_tx.parent.name}  ({_age(last_tx.stat().st_mtime)})")
-            item("▸ Open transcript", "/usr/bin/open", str(last_tx), refresh=False)
+            # Via mrec, not `open`: a bare .md goes to whatever app claims markdown
+            # (an editor), while this renders summary + transcript for reading.
+            item("▸ Open transcript", str(MREC), "open-transcript", str(last_tx), refresh=False)
         print("---")
     item("Open recordings folder", "/usr/bin/open", str(RECORDINGS), refresh=False)
     item("Open log", "/usr/bin/open", str(LOG), refresh=False)

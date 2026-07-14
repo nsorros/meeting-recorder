@@ -47,6 +47,12 @@ STOP_REQUEST_FILE = STATE_DIR / "stop-request"
 # Published so the menu bar can show a real state (recording / transcribing /
 # watching) instead of a static label. Written by the watcher, read by the plugin.
 WATCHER_STATUS_FILE = STATE_DIR / "watcher-status"
+# OpenRouter balance, cached so the once-a-minute menu bar isn't a once-a-minute
+# API call. See openrouter_credits().
+CREDITS_CACHE = STATE_DIR / "openrouter-credits.json"
+# Transcripts rendered to HTML for reading in the browser. Derived output, kept
+# out of the recording folders so those stay source-only.
+RENDERED_DIR = STATE_DIR / "rendered"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 # Notification logo: osascript notifications are locked to the generic script
 # icon, so when terminal-notifier is installed we route through it with -appIcon
@@ -137,6 +143,12 @@ OPENROUTER_PROMPT = os.environ.get(
 # Optional dotenv-style file to read OPENROUTER_API_KEY from when it is not in
 # the environment (e.g. the ant app's ~/code/ant/.env). Only the key line is read.
 OPENROUTER_ENV_FILE = os.environ.get("MEETING_RECORDER_OPENROUTER_ENV_FILE", "").strip()
+OPENROUTER_CREDITS_TIMEOUT = int(os.environ.get("MEETING_RECORDER_OPENROUTER_CREDITS_TIMEOUT", "10"))
+# Once the balance hits zero OpenRouter answers 402 and every transcription
+# silently downgrades to local Whisper, so warn while there is still time to top
+# up. Roughly: $0.12 buys an hour of audio on Gemini Flash.
+LOW_CREDIT_USD = float(os.environ.get("MEETING_RECORDER_LOW_CREDIT_USD", "2") or 0)
+USD_PER_AUDIO_HOUR = 0.12
 # Silence guard: a reboot can reset the default output device away from the
 # Multi-Output/BlackHole loopback, so ffmpeg captures pure digital silence.
 # Recordings at or below this mean dBFS abort with an actionable error instead
@@ -1090,8 +1102,16 @@ def transcribe_with_whisper(audio: Path, out_dir: Path) -> Path:
     return raw_txt
 
 
-def openrouter_api_key() -> str:
-    """Resolve the OpenRouter key from the environment, or an optional env file."""
+def openrouter_api_key(*, quiet: bool = False) -> str:
+    """Resolve the OpenRouter key from the environment, or an optional env file.
+
+    quiet suppresses the not-found logging for pollers (menu bar, doctor) that
+    would otherwise write the same line every refresh.
+    """
+    def note(message: str) -> None:
+        if not quiet:
+            log(message)
+
     for var in ("MEETING_RECORDER_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"):
         val = os.environ.get(var, "").strip()
         if val:
@@ -1105,12 +1125,92 @@ def openrouter_api_key() -> str:
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
             # File read fine but held no key line — say so rather than falling
             # back to Whisper with a bare "no key" message.
-            log(f"openrouter: env file {display_path(env_path)} has no OPENROUTER_API_KEY= line")
+            note(f"openrouter: env file {display_path(env_path)} has no OPENROUTER_API_KEY= line")
         except Exception as exc:
-            log(f"openrouter: could not read env file {display_path(env_path)} ({exc})")
+            note(f"openrouter: could not read env file {display_path(env_path)} ({exc})")
     else:
-        log("openrouter: no key in environment and MEETING_RECORDER_OPENROUTER_ENV_FILE is unset")
+        note("openrouter: no key in environment and MEETING_RECORDER_OPENROUTER_ENV_FILE is unset")
     return ""
+
+
+def openrouter_credits(key: str, *, max_age: int = 0) -> dict:
+    """Remaining/granted USD from OpenRouter's /credits endpoint.
+
+    Cached under STATE_DIR for max_age seconds so the once-a-minute menu bar does
+    not hit the network on every refresh. Raises on request failure.
+    """
+    if max_age > 0:
+        try:
+            cached = json.loads(CREDITS_CACHE.read_text(encoding="utf-8"))
+            if time.time() - float(cached["fetched_at"]) < max_age:
+                return cached
+        except Exception:
+            pass
+    req = urllib.request.Request(
+        OPENROUTER_BASE_URL.rstrip("/") + "/credits",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OPENROUTER_CREDITS_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:200]
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    data = payload.get("data") or {}
+    granted = float(data.get("total_credits") or 0.0)
+    used = float(data.get("total_usage") or 0.0)
+    result = {"granted": granted, "used": used, "remaining": granted - used, "fetched_at": time.time()}
+    try:
+        CREDITS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CREDITS_CACHE.write_text(json.dumps(result), encoding="utf-8")
+    except Exception:
+        pass
+    return result
+
+
+def transcription_plan(*, max_age: int = 0) -> dict:
+    """Which engine a recording finishing right now would actually transcribe on.
+
+    Walks the same fallback chain as transcribe_audio() — engine setting, then
+    key, then credits — without transcribing anything, so `doctor` and the menu
+    bar can show the real answer instead of the configured intent. An exhausted
+    balance is reported as Whisper because that is what a 402 will produce.
+    """
+    whisper = {"engine": "whisper", "model": WHISPER_MODEL, "credits": None, "warning": ""}
+    if TRANSCRIBE_ENGINE != "openrouter":
+        return {**whisper, "reason": f"MEETING_RECORDER_TRANSCRIBE_ENGINE={TRANSCRIBE_ENGINE}"}
+
+    key = openrouter_api_key(quiet=True)
+    if not key:
+        return {**whisper, "reason": "no OpenRouter API key",
+                "warning": "Set MEETING_RECORDER_OPENROUTER_ENV_FILE (or OPENROUTER_API_KEY) to use OpenRouter."}
+
+    openrouter = {"engine": "openrouter", "model": OPENROUTER_MODEL}
+    try:
+        credits = openrouter_credits(key, max_age=max_age)
+    except Exception as exc:
+        # A rejected key fails the same way at transcribe time, so call it as
+        # Whisper. A network blip doesn't — that stays an unverified OpenRouter.
+        if isinstance(exc, RuntimeError) and re.search(r"HTTP (401|403)", str(exc)):
+            return {**whisper, "reason": "OpenRouter rejected the API key",
+                    "warning": f"Key rejected ({exc}) — transcription falls back to slow local "
+                               "Whisper until it is fixed."}
+        return {**openrouter, "credits": None, "reason": "credits check failed",
+                "warning": f"Could not verify balance ({exc}); will fall back to Whisper if the "
+                           "balance turns out to be empty."}
+
+    remaining = credits["remaining"]
+    if remaining <= 0:
+        return {**whisper, "credits": credits, "reason": "OpenRouter balance exhausted",
+                "warning": f"Balance ${remaining:.2f} — OpenRouter will answer 402 and every "
+                           "transcription falls back to slow local Whisper. Top up at "
+                           "https://openrouter.ai/settings/credits"}
+    warning = ""
+    if LOW_CREDIT_USD and remaining < LOW_CREDIT_USD:
+        warning = (f"Only ${remaining:.2f} left (~{remaining / USD_PER_AUDIO_HOUR:.0f}h of audio) — "
+                   "top up at https://openrouter.ai/settings/credits before it silently "
+                   "drops to local Whisper.")
+    return {**openrouter, "credits": credits, "reason": "key present, credits available", "warning": warning}
 
 
 def openrouter_transcribe_chunk(mp3: Path, key: str) -> str:
@@ -1552,6 +1652,227 @@ def stop_recording_command() -> int:
     return 0
 
 
+TRANSCRIPT_CSS = """
+:root { color-scheme: light dark; --fg:#1c1c1e; --muted:#6b6b70; --bg:#fdfdfc;
+        --rule:#e3e3e0; --accent:#7a5cff; --code-bg:#f2f2ef; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e8e8ea; --muted:#9a9aa0; --bg:#17171a; --rule:#2e2e33;
+          --accent:#a894ff; --code-bg:#232328; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); line-height: 1.65; font-size: 17px;
+       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+       -webkit-font-smoothing: antialiased; }
+h1, h2, h3 { line-height: 1.25; margin: 2.4em 0 0.7em; font-weight: 650; letter-spacing: -0.015em; }
+h1 { font-size: 1.9rem; margin-top: 0; }
+h2 { font-size: 1.3rem; padding-bottom: 0.3em; border-bottom: 1px solid var(--rule); }
+h3 { font-size: 1.08rem; color: var(--muted); }
+p, li { overflow-wrap: break-word; }
+ul, ol { padding-left: 1.3em; }
+li { margin: 0.35em 0; }
+strong { font-weight: 650; }
+a { color: var(--accent); }
+code { background: var(--code-bg); padding: 0.15em 0.4em; border-radius: 4px;
+       font-size: 0.87em; font-family: "SF Mono", ui-monospace, Menlo, monospace; }
+pre { background: var(--code-bg); padding: 1rem; border-radius: 8px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+blockquote { margin: 1.4em 0; padding: 0.2em 0 0.2em 1.1em; border-left: 3px solid var(--accent);
+             color: var(--muted); }
+table { border-collapse: collapse; width: 100%; margin: 1.5em 0; font-size: 0.94em; display: block;
+        overflow-x: auto; }
+th, td { border: 1px solid var(--rule); padding: 0.5em 0.75em; text-align: left; }
+th { background: var(--code-bg); font-weight: 620; }
+.meta { color: var(--muted); font-size: 0.82rem; margin: 0 0 2.5rem; padding-bottom: 1rem;
+        border-bottom: 1px solid var(--rule); }
+.meta-inline, .muted { color: var(--muted); font-size: 0.85rem; }
+.meta-inline { margin: -0.4em 0 1.8em; }
+main { margin: 0 auto; padding: 2.5rem 1.5rem 6rem; max-width: 46rem; }
+.nav { position: sticky; top: 0; z-index: 10; display: flex; gap: 1.5rem;
+       padding: 0.85rem 1.5rem; background: color-mix(in srgb, var(--bg) 88%, transparent);
+       backdrop-filter: saturate(180%) blur(12px); border-bottom: 1px solid var(--rule); }
+.nav a { color: var(--muted); text-decoration: none; font-size: 0.82rem; font-weight: 550;
+         letter-spacing: 0.01em; }
+.nav a:hover { color: var(--accent); }
+/* Offset sticky-nav overlap when jumping to a section. */
+section { scroll-margin-top: 3.5rem; }
+/* Outranks the h2s inside either section, so it reads as the page's divider. */
+.section-head { margin-top: 4.5rem; font-size: 1.5rem; border-bottom: 2px solid var(--accent);
+                padding-bottom: 0.35em; }
+/* Raw transcript: speech, not code — body font, but keep its line breaks. */
+.raw { white-space: pre-wrap; overflow-wrap: break-word; }
+"""
+
+
+_LIST_START = re.compile(r"^([-*+]|\d+\.)\s+\S")
+
+
+def normalize_tight_lists(md_text: str) -> str:
+    """Insert the blank line Python-Markdown wants before a list that starts
+    directly beneath a paragraph.
+
+    The cleanup step routinely writes bullets straight under a bold lead-in, and
+    without a preceding blank line every bullet renders as literal "- text" glued
+    into the paragraph. Indented lines are left alone so multi-line list items
+    stay tight.
+    """
+    out: list[str] = []
+    in_fence = False
+    for line in md_text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        elif (not in_fence and out and _LIST_START.match(line)
+                and out[-1].strip()
+                and not out[-1].startswith((" ", "\t"))
+                and not _LIST_START.match(out[-1])
+                and not out[-1].lstrip().startswith((">", "|"))):
+            out.append("")
+        out.append(line)
+    return "\n".join(out)
+
+
+def markdown_to_html_body(md_text: str) -> str:
+    """Render markdown to an HTML fragment.
+
+    Transcripts use headings, bullets, tables, fences and blockquotes, so this
+    prefers the markdown module, then pandoc. With neither, the text is shown
+    preformatted rather than not at all.
+    """
+    md_text = normalize_tight_lists(md_text)
+    try:
+        import markdown as _markdown
+
+        return _markdown.markdown(md_text, extensions=["extra", "sane_lists"])
+    except ImportError:
+        pass
+    if command_exists("pandoc"):
+        proc = subprocess.run(["pandoc", "-f", "markdown", "-t", "html"],
+                              input=md_text, text=True, capture_output=True)
+        if proc.returncode == 0:
+            return proc.stdout
+    return f"<pre>{escape(md_text)}</pre>"
+
+
+def _h1(md_text: str) -> str:
+    m = re.search(r"^#\s+(.+)$", md_text, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _strip_h1(md_text: str, title: str) -> str:
+    """Drop a leading H1 that just repeats the page title."""
+    lines = md_text.splitlines()
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if line.startswith("# ") and line[2:].strip() == title:
+            return "\n".join(lines[:i] + lines[i + 1:])
+        break
+    return md_text
+
+
+def full_transcript_for(md_file: Path) -> tuple[Path | None, str]:
+    """The full-transcript file paired with a .meeting.md, and its kind.
+
+    The cleanup either writes a short summary beside a separate <stem>-cleaned.md,
+    or folds notes and transcript together into the .meeting.md and leaves only
+    the raw <stem>.txt. Prefer the cleaned one: it has speaker labels.
+    """
+    name = md_file.name
+    stem = name[: -len(".meeting.md")] if name.endswith(".meeting.md") else md_file.stem
+    cleaned = md_file.parent / f"{stem}-cleaned.md"
+    if cleaned.exists():
+        return cleaned, "cleaned"
+    raw = md_file.parent / f"{stem}.txt"
+    if raw.exists():
+        return raw, "raw"
+    return None, ""
+
+
+def render_transcript_html(md_file: Path) -> Path:
+    """Render a .meeting.md, plus the full transcript beside it, to one HTML page."""
+    md_text = md_file.read_text(encoding="utf-8", errors="replace")
+    transcript_file, kind = full_transcript_for(md_file)
+    tx_text = transcript_file.read_text(encoding="utf-8", errors="replace") if transcript_file else ""
+
+    # The summary often has no H1 of its own; the cleaned transcript usually does.
+    title = _h1(md_text) or _h1(tx_text) or md_file.parent.name
+
+    if kind == "cleaned":
+        # Both halves are titled with the same H1; the page shows it once already.
+        transcript_html = markdown_to_html_body(_strip_h1(tx_text, title))
+        source_note = f"cleaned &amp; speaker-attributed · {escape(transcript_file.name)}"
+    elif kind == "raw":
+        # Raw output is a handful of chunk-length lines, not markdown — wrap it as
+        # prose rather than feeding it to the markdown renderer.
+        transcript_html = f"<div class='raw'>{escape(tx_text.strip())}</div>"
+        source_note = f"raw, as transcribed · {escape(transcript_file.name)}"
+    else:
+        transcript_html = "<p class='muted'>No full transcript was found next to this summary.</p>"
+        source_note = ""
+
+    recorded = dt.datetime.fromtimestamp(md_file.stat().st_mtime).strftime("%a %d %b %Y, %H:%M")
+    out = RENDERED_DIR / f"{md_file.stem}.html"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        "<!doctype html>\n<html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{escape(title)}</title><style>{TRANSCRIPT_CSS}</style></head><body>"
+        "<nav class='nav'><a href='#summary'>Summary</a><a href='#transcript'>Full transcript</a></nav>"
+        "<main>"
+        f"<h1>{escape(title)}</h1>"
+        f"<div class='meta'>{escape(recorded)} · {escape(md_file.parent.name)}</div>"
+        f"<section id='summary'>{markdown_to_html_body(_strip_h1(md_text, title))}</section>"
+        "<section id='transcript'><h2 class='section-head'>Full transcript</h2>"
+        f"{f'<div class=meta-inline>{source_note}</div>' if source_note else ''}"
+        f"{transcript_html}</section>"
+        "</main></body></html>",
+        encoding="utf-8",
+    )
+    return out
+
+
+def latest_transcript() -> Path | None:
+    """Newest cleaned transcript, or None."""
+    found = sorted(ROOT.glob("*/*.meeting.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return found[0] if found else None
+
+
+def open_transcript(path: str | None) -> int:
+    """Open a transcript rendered in the browser.
+
+    Bare `open` on a .md hands it to whatever app claims markdown (VS Code here),
+    which is an editor, not a reader — so render it and open the HTML instead.
+    """
+    md_file = Path(path).expanduser() if path else latest_transcript()
+    if md_file is None:
+        print(f"no transcripts under {display_path(ROOT)} yet", file=sys.stderr)
+        return 1
+    if not md_file.exists():
+        print(f"no such transcript: {display_path(md_file)}", file=sys.stderr)
+        return 1
+    html = render_transcript_html(md_file)
+    subprocess.run(["/usr/bin/open", str(html)], check=False)
+    return 0
+
+
+def print_engine(as_json: bool = False, max_age: int = 0) -> int:
+    """Show which engine the next transcription will use. Exit 1 if that is a
+    downgrade (Whisper despite OpenRouter being configured) or credits are low."""
+    plan = transcription_plan(max_age=max_age)
+    if as_json:
+        print(json.dumps(plan))
+    else:
+        label = f"{plan['engine']}:{plan['model']}" if plan["engine"] == "openrouter" else f"whisper ({plan['model']})"
+        print(f"next transcription: {label}  [{plan['reason']}]")
+        credits = plan.get("credits")
+        if credits:
+            print(f"openrouter credits: ${credits['remaining']:.2f} left of ${credits['granted']:.2f} "
+                  f"(~{max(credits['remaining'], 0) / USD_PER_AUDIO_HOUR:.0f}h of audio)")
+        if plan["warning"]:
+            print(f"⚠️  {plan['warning']}")
+    degraded = plan["engine"] != "openrouter" and TRANSCRIBE_ENGINE == "openrouter"
+    return 1 if (degraded or plan["warning"]) else 0
+
+
 def doctor() -> int:
     ok = True
     for binary in ("ffmpeg", "whisper", "claude", "osascript"):
@@ -1560,6 +1881,9 @@ def doctor() -> int:
         ok = ok and exists
     print(f"recordings: {ROOT}")
     print(f"log: {LOG}")
+
+    print("\ntranscription:")
+    print_engine()
 
     print(f"\ncapture backend: {CAPTURE_BACKEND}")
     if CAPTURE_BACKEND in ("auto", "screencapturekit", "sck"):
@@ -1743,6 +2067,15 @@ def install_launch_agent() -> Path:
         env_vars["MEETING_RECORDER_CLAUDE_MODEL"] = CLAUDE_MODEL
     if DISABLE_CLAUDE:
         env_vars["MEETING_RECORDER_DISABLE_CLAUDE"] = "1"
+    # Without these the regenerated plist loses the OpenRouter config and the
+    # daemon silently drops back to local Whisper. The key itself is deliberately
+    # not written here — the plist is world-readable; point at an env file instead.
+    if TRANSCRIBE_ENGINE:
+        env_vars["MEETING_RECORDER_TRANSCRIBE_ENGINE"] = TRANSCRIBE_ENGINE
+    if OPENROUTER_ENV_FILE:
+        env_vars["MEETING_RECORDER_OPENROUTER_ENV_FILE"] = str(Path(OPENROUTER_ENV_FILE).expanduser())
+    if OPENROUTER_MODEL:
+        env_vars["MEETING_RECORDER_OPENROUTER_MODEL"] = OPENROUTER_MODEL
 
     env_xml = "\n".join(
         f"    <key>{escape(key)}</key>\n    <string>{escape(value)}</string>"
@@ -1841,6 +2174,12 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("watch", help="run the background watcher in the foreground")
     sub.add_parser("doctor", help="check dependencies and visible audio devices")
+    engine = sub.add_parser("engine", help="show which engine the next transcription will use (and OpenRouter credits)")
+    engine.add_argument("--json", action="store_true", help="machine-readable output")
+    engine.add_argument("--max-age", type=int, default=0,
+                        help="accept a cached credits reading up to N seconds old (default: always fresh)")
+    open_tx = sub.add_parser("open-transcript", help="open a transcript rendered in the browser (default: the newest)")
+    open_tx.add_argument("path", nargs="?", help="path to a .meeting.md (default: most recent)")
     rec = sub.add_parser("record", help="record immediately until Ctrl-C")
     rec.add_argument("label", nargs="?", default="manual-meeting")
     tr = sub.add_parser("transcribe", help="transcribe an existing audio file")
@@ -1862,6 +2201,10 @@ def main() -> int:
     if args.command == "watch":
         watch()
         return 0
+    if args.command == "engine":
+        return print_engine(as_json=args.json, max_age=args.max_age)
+    if args.command == "open-transcript":
+        return open_transcript(args.path)
     if args.command == "doctor":
         return doctor()
     if args.command == "record":
