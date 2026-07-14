@@ -1184,6 +1184,12 @@ def transcription_plan(*, max_age: int = 0) -> dict:
     if not key:
         return {**whisper, "reason": "no OpenRouter API key",
                 "warning": "Set MEETING_RECORDER_OPENROUTER_ENV_FILE (or OPENROUTER_API_KEY) to use OpenRouter."}
+    # transcribe_with_openrouter() needs both to transcode and chunk the audio, and
+    # raises without them — checked here in the same order so the prediction holds.
+    if not command_exists("ffmpeg") or not command_exists("ffprobe"):
+        return {**whisper, "reason": "ffmpeg/ffprobe missing",
+                "warning": "OpenRouter transcription needs ffmpeg and ffprobe to chunk the audio "
+                           "(brew install ffmpeg); without them every run falls back to slow local Whisper."}
 
     openrouter = {"engine": "openrouter", "model": OPENROUTER_MODEL}
     try:
@@ -1191,9 +1197,10 @@ def transcription_plan(*, max_age: int = 0) -> dict:
     except Exception as exc:
         # A rejected key fails the same way at transcribe time, so call it as
         # Whisper. A network blip doesn't — that stays an unverified OpenRouter.
-        if isinstance(exc, RuntimeError) and re.search(r"HTTP (401|403)", str(exc)):
-            return {**whisper, "reason": "OpenRouter rejected the API key",
-                    "warning": f"Key rejected ({exc}) — transcription falls back to slow local "
+        # 401/402/403 are what openrouter_transcribe_chunk() refuses to retry.
+        if isinstance(exc, RuntimeError) and re.search(r"HTTP (401|402|403)", str(exc)):
+            return {**whisper, "reason": "OpenRouter rejected the key or the balance",
+                    "warning": f"Rejected ({exc}) — transcription falls back to slow local "
                                "Whisper until it is fixed."}
         return {**openrouter, "credits": None, "reason": "credits check failed",
                 "warning": f"Could not verify balance ({exc}); will fall back to Whisper if the "
@@ -1703,7 +1710,10 @@ section { scroll-margin-top: 3.5rem; }
 """
 
 
-_LIST_START = re.compile(r"^([-*+]|\d+\.)\s+\S")
+# Bullets only, deliberately: an ordered marker would also match ordinary prose
+# ("2. Ship it by Friday" under a paragraph), and forcing that into a list is a
+# worse error than leaving it. The cleanup writes no numbered lists in practice.
+_LIST_START = re.compile(r"^[-*+]\s+\S")
 
 
 def normalize_tight_lists(md_text: str) -> str:
@@ -1730,6 +1740,26 @@ def normalize_tight_lists(md_text: str) -> str:
     return "\n".join(out)
 
 
+def _escape_html_extension():
+    """Markdown extension that renders angle brackets as text instead of markup.
+
+    A transcript is speech, never intentional HTML, but Python-Markdown passes raw
+    HTML through untouched — so a spoken "<inaudible>" marker is parsed as a tag and
+    silently disappears from the page, and anything tag-shaped in the audio would
+    run as markup in the browser. Deregistering the two HTML processors is the
+    upstream-documented replacement for the removed safe_mode. Built lazily: the
+    base class only exists if the markdown module imported.
+    """
+    from markdown.extensions import Extension
+
+    class EscapeHtml(Extension):
+        def extendMarkdown(self, md):
+            md.preprocessors.deregister("html_block")
+            md.inlinePatterns.deregister("html")
+
+    return EscapeHtml()
+
+
 def markdown_to_html_body(md_text: str) -> str:
     """Render markdown to an HTML fragment.
 
@@ -1741,11 +1771,12 @@ def markdown_to_html_body(md_text: str) -> str:
     try:
         import markdown as _markdown
 
-        return _markdown.markdown(md_text, extensions=["extra", "sane_lists"])
+        return _markdown.markdown(md_text, extensions=["extra", "sane_lists", _escape_html_extension()])
     except ImportError:
         pass
     if command_exists("pandoc"):
-        proc = subprocess.run(["pandoc", "-f", "markdown", "-t", "html"],
+        # -raw_html for the same reason as _EscapeHtml below.
+        proc = subprocess.run(["pandoc", "-f", "markdown-raw_html", "-t", "html"],
                               input=md_text, text=True, capture_output=True)
         if proc.returncode == 0:
             return proc.stdout
@@ -1797,8 +1828,9 @@ def render_transcript_html(md_file: Path) -> Path:
     title = _h1(md_text) or _h1(tx_text) or md_file.parent.name
 
     if kind == "cleaned":
-        # Both halves are titled with the same H1; the page shows it once already.
-        transcript_html = markdown_to_html_body(_strip_h1(tx_text, title))
+        # Drop its own leading H1 whatever it says: the page is already titled and
+        # this section already has a header, and an h1 here would outrank both.
+        transcript_html = markdown_to_html_body(_strip_h1(tx_text, _h1(tx_text)))
         source_note = f"cleaned &amp; speaker-attributed · {escape(transcript_file.name)}"
     elif kind == "raw":
         # Raw output is a handful of chunk-length lines, not markdown — wrap it as
