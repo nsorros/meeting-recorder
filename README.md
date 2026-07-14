@@ -14,10 +14,12 @@ Local macOS meeting recorder:
 
 ```sh
 ~/code/meeting-recorder/mrec doctor
+~/code/meeting-recorder/mrec engine
 ~/code/meeting-recorder/mrec watch
 ~/code/meeting-recorder/mrec record test-meeting
 ~/code/meeting-recorder/mrec record-start menubar-manual
 ~/code/meeting-recorder/mrec record-stop
+~/code/meeting-recorder/mrec open-transcript
 ~/code/meeting-recorder/mrec transcribe ~/Meetings/Recordings/example.m4a
 ~/code/meeting-recorder/mrec install-app
 ~/code/meeting-recorder/mrec build-recorder
@@ -52,6 +54,32 @@ export MEETING_RECORDER_OPENROUTER_API_KEY=sk-or-v1-...
 # ...or point at a dotenv file to read OPENROUTER_API_KEY from (e.g. the ant app)
 export MEETING_RECORDER_OPENROUTER_ENV_FILE=~/code/ant/.env
 ```
+
+The background watcher does not inherit your shell environment: `mrec start` bakes
+`MEETING_RECORDER_TRANSCRIBE_ENGINE`, `MEETING_RECORDER_OPENROUTER_ENV_FILE` and
+`MEETING_RECORDER_OPENROUTER_MODEL` into the LaunchAgent plist, so export them
+before running it (and run it again after changing them). The **key itself is never
+written to the plist** — that file is world-readable, so point at an env file
+instead.
+
+### Which engine will actually run
+
+Because the fallback is silent, a dead API key or an empty balance shows up only
+as slower, worse transcripts. `mrec engine` answers the question up front — it
+walks the same chain as a real run (engine setting → key → credits) and reports
+what would happen now, exiting non-zero on a downgrade or a low balance:
+
+```sh
+$ mrec engine
+next transcription: openrouter:google/gemini-2.5-flash  [key present, credits available]
+openrouter credits: $7.33 left of $130.00 (~61h of audio)
+```
+
+Once the balance hits zero OpenRouter returns HTTP 402 and every recording falls
+back to local Whisper, so `mrec engine` warns below
+`MEETING_RECORDER_LOW_CREDIT_USD` (default `$2`) while there is still time to top
+up. The same line appears in `mrec doctor` and in the menu bar, which reads a
+cached balance (`--max-age`) rather than calling the API every refresh.
 
 A **silence guard** aborts transcription with an actionable error when a recording
 is digital silence (mean ≤ `MEETING_RECORDER_SILENCE_DB`, default `-80` dBFS) —
@@ -117,6 +145,24 @@ Choose a Claude model:
 ```sh
 export MEETING_RECORDER_CLAUDE_MODEL=sonnet
 ```
+
+## Reading Transcripts
+
+```sh
+mrec open-transcript                    # the newest meeting
+mrec open-transcript path/to/x.meeting.md
+```
+
+Opens the meeting rendered in your **browser** — the notes/summary first, then the
+full transcript below, with a jump link between them. Where the cleanup wrote a
+separate `<stem>-cleaned.md` that speaker-attributed version is used; otherwise the
+raw `<stem>.txt` is shown as prose.
+
+This exists because `open`-ing a `.md` hands it to whichever app has claimed
+markdown on your Mac — typically an *editor* (VS Code), which is the wrong tool for
+reading a 30 KB transcript. Rendering is done with the `markdown` module, falling
+back to `pandoc`, then to preformatted text. Pages are written to
+`~/.local/state/meeting-recorder/rendered/` and are safe to delete.
 
 ## Speaker Labels
 
@@ -210,6 +256,7 @@ The menu shows:
 - filled record circle `Rec <elapsed>`: a recording is running
 - `Transcribing…`: cleaning up the last meeting
 - waveform-slash `Off`: watcher stopped
+- **which engine the next transcription will use**, plus the OpenRouter balance (`Transcribes with: gemini-2.5-flash · $7.33 left`), turning red when it has degraded to Whisper or the balance is nearly out
 - the **last recording** and **last transcript**, each with their age and a one-click action to play / open them
 
 Menu actions:
@@ -217,7 +264,7 @@ Menu actions:
 - start/stop the login watcher
 - start a manual recording
 - stop the manual recording and transcribe it
-- play the last recording / open the last transcript
+- play the last recording / open the last transcript (rendered in the browser)
 - open recordings
 - open logs
 - run doctor
@@ -259,6 +306,8 @@ Environment variables:
 - `MEETING_RECORDER_OPENROUTER_MODEL`: OpenRouter audio model. Default: `google/gemini-2.5-flash` (try `google/gemini-2.5-flash-lite` for ~3× cheaper).
 - `MEETING_RECORDER_OPENROUTER_API_KEY` / `OPENROUTER_API_KEY`: the key. If neither is set, `MEETING_RECORDER_OPENROUTER_ENV_FILE` is read.
 - `MEETING_RECORDER_OPENROUTER_ENV_FILE`: optional dotenv file to read `OPENROUTER_API_KEY` from (e.g. `~/code/ant/.env`).
+- `MEETING_RECORDER_LOW_CREDIT_USD`: warn in `mrec engine` / `doctor` / the menu bar when the OpenRouter balance drops below this. At `$0` the API returns 402 and every transcription silently falls back to Whisper. Default: `2`. Set to `0` to disable.
+- `MEETING_RECORDER_OPENROUTER_CREDITS_TIMEOUT`: timeout for the `/credits` balance check. Default: `10`s.
 - `MEETING_RECORDER_OPENROUTER_CHUNK_SECONDS`: audio chunk length sent per request. Default: `600`.
 - `MEETING_RECORDER_OPENROUTER_TIMEOUT` / `MEETING_RECORDER_OPENROUTER_MAX_RETRIES`: per-request timeout (`300`s) and retry count (`3`).
 - `MEETING_RECORDER_OPENROUTER_PROMPT`: override the transcription instruction.
