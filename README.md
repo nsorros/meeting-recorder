@@ -165,12 +165,20 @@ export MEETING_RECORDER_CLAUDE_MODEL=sonnet
 ```sh
 mrec open-transcript                    # the newest meeting
 mrec open-transcript path/to/x.meeting.md
+mrec rerun-cleanup                      # retry Claude cleanup for the newest meeting
+mrec rerun-cleanup path/to/x.meeting.md --open
 ```
 
 Opens the meeting rendered in your **browser** — the notes/summary first, then the
 full transcript below, with a jump link between them. Where the cleanup wrote a
 separate `<stem>-cleaned.md` that speaker-attributed version is used; otherwise the
 raw `<stem>.txt` is shown as prose.
+
+Rendered pages include a **Rerun cleanup** button. It opens a small generated
+`.command` file that retries only the Claude cleanup pass against the existing
+raw transcript, then reopens the rendered page. If Claude is still unavailable or
+rate limited, the current notes are left untouched and the failure is written to
+the meeting's `.claude.log`.
 
 This exists because `open`-ing a `.md` hands it to whichever app has claimed
 markdown on your Mac — typically an *editor* (VS Code), which is the wrong tool for

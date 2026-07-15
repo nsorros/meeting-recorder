@@ -1419,7 +1419,13 @@ def write_basic_meeting_md(raw_txt: Path, final_md: Path, audio: Path) -> None:
     )
 
 
-def clean_with_claude(raw_txt: Path, final_md: Path, audio: Path, diarized_txt: Path | None = None) -> None:
+def clean_with_claude(
+    raw_txt: Path,
+    final_md: Path,
+    audio: Path,
+    diarized_txt: Path | None = None,
+    preserve_on_failure: bool = False,
+) -> bool:
     transcript_text = raw_txt.read_text(encoding="utf-8", errors="replace")
     if diarized_txt is not None:
         speaker_note = (
@@ -1469,14 +1475,17 @@ Raw transcript:
     (final_md.with_suffix(".claude.log")).write_text(proc.stderr, encoding="utf-8")
     if proc.returncode != 0:
         log(f"claude cleanup failed with exit code {proc.returncode}; writing fallback transcript")
+        if preserve_on_failure:
+            return False
         final_md.write_text(
             "# Claude cleanup failed\n\n"
             f"Audio: `{audio}`\n\nRaw transcript: `{raw_txt}`\n\n"
             "```text\n" + raw_txt.read_text(encoding="utf-8", errors="replace") + "\n```\n",
             encoding="utf-8",
         )
-        return
+        return False
     final_md.write_text(proc.stdout, encoding="utf-8")
+    return True
 
 
 def watch() -> None:
@@ -1760,11 +1769,16 @@ th { background: var(--code-bg); font-weight: 620; }
 .meta-inline { margin: -0.4em 0 1.8em; }
 main { margin: 0 auto; padding: 2.5rem 1.5rem 6rem; max-width: 46rem; }
 .nav { position: sticky; top: 0; z-index: 10; display: flex; gap: 1.5rem;
+       align-items: center;
        padding: 0.85rem 1.5rem; background: color-mix(in srgb, var(--bg) 88%, transparent);
        backdrop-filter: saturate(180%) blur(12px); border-bottom: 1px solid var(--rule); }
 .nav a { color: var(--muted); text-decoration: none; font-size: 0.82rem; font-weight: 550;
          letter-spacing: 0.01em; }
 .nav a:hover { color: var(--accent); }
+.nav .spacer { flex: 1; }
+.nav .action { padding: 0.24rem 0.55rem; border: 1px solid var(--rule); border-radius: 6px;
+               color: var(--fg); background: var(--code-bg); }
+.nav .action:hover { border-color: var(--accent); color: var(--accent); }
 /* Offset sticky-nav overlap when jumping to a section. */
 section { scroll-margin-top: 3.5rem; }
 /* Outranks the h2s inside either section, so it reads as the page's divider. */
@@ -1883,6 +1897,80 @@ def full_transcript_for(md_file: Path) -> tuple[Path | None, str]:
     return None, ""
 
 
+def meeting_stem(md_file: Path) -> str:
+    name = md_file.name
+    return name[: -len(".meeting.md")] if name.endswith(".meeting.md") else md_file.stem
+
+
+def raw_transcript_for(md_file: Path) -> Path | None:
+    raw = md_file.parent / f"{meeting_stem(md_file)}.txt"
+    return raw if raw.exists() else None
+
+
+def diarized_transcript_for(md_file: Path) -> Path | None:
+    dia_dir = md_file.parent / "diarization"
+    if not dia_dir.exists():
+        return None
+    candidates = sorted(dia_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def audio_for_meeting(md_file: Path) -> Path | None:
+    stem = meeting_stem(md_file)
+    for suffix in (".wav", ".m4a", ".mp3", ".aac", ".flac"):
+        candidate = md_file.parent.parent / f"{stem}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def rerun_cleanup_command_for(md_file: Path) -> Path:
+    """Create a clickable macOS command that retries cleanup for this meeting."""
+    RENDERED_DIR.mkdir(parents=True, exist_ok=True)
+    script = RENDERED_DIR / f"{md_file.stem}.rerun-cleanup.command"
+    mrec = Path(__file__).resolve().parent / "mrec"
+    script.write_text(
+        "#!/bin/zsh\n"
+        "set -e\n"
+        f"{shlex.quote(str(mrec))} rerun-cleanup {shlex.quote(str(md_file))} --open\n"
+        "echo\n"
+        "echo 'Cleanup finished. You can close this window.'\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def rerun_cleanup(path: str | None, open_after: bool = False) -> int:
+    md_file = Path(path).expanduser() if path else latest_transcript()
+    if md_file is None:
+        print(f"no transcripts under {display_path(ROOT)} yet", file=sys.stderr)
+        return 1
+    if not md_file.exists():
+        print(f"no such transcript: {display_path(md_file)}", file=sys.stderr)
+        return 1
+    raw_txt = raw_transcript_for(md_file)
+    if raw_txt is None:
+        print(f"no raw transcript next to {display_path(md_file)}", file=sys.stderr)
+        return 1
+    audio = audio_for_meeting(md_file) or md_file
+    ok = clean_with_claude(
+        raw_txt,
+        md_file,
+        audio,
+        diarized_txt=diarized_transcript_for(md_file),
+        preserve_on_failure=True,
+    )
+    if not ok:
+        print(f"cleanup failed; kept existing notes: {display_path(md_file)}", file=sys.stderr)
+        print(f"log: {display_path(md_file.with_suffix('.claude.log'))}", file=sys.stderr)
+        return 1
+    print(f"updated notes: {display_path(md_file)}")
+    if open_after:
+        return open_transcript(str(md_file))
+    return 0
+
+
 def render_transcript_html(md_file: Path) -> Path:
     """Render a .meeting.md, plus the full transcript beside it, to one HTML page."""
     md_text = md_file.read_text(encoding="utf-8", errors="replace")
@@ -1907,13 +1995,15 @@ def render_transcript_html(md_file: Path) -> Path:
         source_note = ""
 
     recorded = dt.datetime.fromtimestamp(md_file.stat().st_mtime).strftime("%a %d %b %Y, %H:%M")
+    rerun_cmd = rerun_cleanup_command_for(md_file)
     out = RENDERED_DIR / f"{md_file.stem}.html"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
         "<!doctype html>\n<html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>{escape(title)}</title><style>{TRANSCRIPT_CSS}</style></head><body>"
-        "<nav class='nav'><a href='#summary'>Summary</a><a href='#transcript'>Full transcript</a></nav>"
+        "<nav class='nav'><a href='#summary'>Summary</a><a href='#transcript'>Full transcript</a>"
+        f"<span class='spacer'></span><a class='action' href='{escape(rerun_cmd.as_uri())}'>Rerun cleanup</a></nav>"
         "<main>"
         f"<h1>{escape(title)}</h1>"
         f"<div class='meta'>{escape(recorded)} · {escape(md_file.parent.name)}</div>"
@@ -2281,6 +2371,9 @@ def main() -> int:
                         help="accept a cached credits reading up to N seconds old (default: always fresh)")
     open_tx = sub.add_parser("open-transcript", help="open a transcript rendered in the browser (default: the newest)")
     open_tx.add_argument("path", nargs="?", help="path to a .meeting.md (default: most recent)")
+    retry = sub.add_parser("rerun-cleanup", help="rerun Claude cleanup for a transcript without retranscribing audio")
+    retry.add_argument("path", nargs="?", help="path to a .meeting.md (default: most recent)")
+    retry.add_argument("--open", action="store_true", help="reopen the rendered transcript after cleanup succeeds")
     rec = sub.add_parser("record", help="record immediately until Ctrl-C")
     rec.add_argument("label", nargs="?", default="manual-meeting")
     tr = sub.add_parser("transcribe", help="transcribe an existing audio file")
@@ -2306,6 +2399,8 @@ def main() -> int:
         return print_engine(as_json=args.json, max_age=args.max_age)
     if args.command == "open-transcript":
         return open_transcript(args.path)
+    if args.command == "rerun-cleanup":
+        return rerun_cleanup(args.path, open_after=args.open)
     if args.command == "doctor":
         return doctor()
     if args.command == "record":
