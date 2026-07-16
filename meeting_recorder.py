@@ -22,9 +22,12 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -53,6 +56,15 @@ CREDITS_CACHE = STATE_DIR / "openrouter-credits.json"
 # Transcripts rendered to HTML for reading in the browser. Derived output, kept
 # out of the recording folders so those stay source-only.
 RENDERED_DIR = STATE_DIR / "rendered"
+# Where the on-demand local transcript server publishes its port + pid, so
+# `open-transcript` can find (and reuse) a server it already started. The server
+# serves rendered pages over http://127.0.0.1 so the "Rerun cleanup" button can
+# actually trigger cleanup and stream progress back — a file:// page can't run a
+# shell command, and a browser renders the .command it used to link as plain text.
+TRANSCRIPT_SERVER_FILE = STATE_DIR / "transcript-server.json"
+# The server exits itself after this long with no request, so a page left open
+# overnight doesn't leave a listener bound forever. Reset on every request.
+TRANSCRIPT_SERVER_IDLE_SECONDS = 3 * 60 * 60
 # OpenRouter settings persisted by `mrec start`. The daemon gets these from its
 # launchd plist, but nothing else does: the xbar menu bar and a plain shell
 # inherit neither, so they used to resolve no key and report a *false* "no
@@ -1777,8 +1789,15 @@ main { margin: 0 auto; padding: 2.5rem 1.5rem 6rem; max-width: 46rem; }
 .nav a:hover { color: var(--accent); }
 .nav .spacer { flex: 1; }
 .nav .action { padding: 0.24rem 0.55rem; border: 1px solid var(--rule); border-radius: 6px;
-               color: var(--fg); background: var(--code-bg); }
+               color: var(--fg); background: var(--code-bg); font: inherit; font-size: 0.82rem;
+               font-weight: 550; letter-spacing: 0.01em; cursor: pointer; text-decoration: none; }
 .nav .action:hover { border-color: var(--accent); color: var(--accent); }
+.nav .action:disabled { cursor: default; opacity: 0.6; border-color: var(--rule); color: var(--muted); }
+/* Progress area for a live "Rerun cleanup": sits under the sticky nav, streams
+   status lines while claude reworks the notes, then the page reloads itself. */
+#rerun-log { position: sticky; top: 3.2rem; z-index: 9; margin: 0; max-height: 8rem; overflow-y: auto;
+             padding: 0.8rem 1.5rem; background: var(--code-bg); border-bottom: 1px solid var(--rule);
+             color: var(--muted); font-size: 0.8rem; white-space: pre-wrap; }
 /* Offset sticky-nav overlap when jumping to a section. */
 section { scroll-margin-top: 3.5rem; }
 /* Outranks the h2s inside either section, so it reads as the page's divider. */
@@ -1786,6 +1805,42 @@ section { scroll-margin-top: 3.5rem; }
                 padding-bottom: 0.35em; }
 /* Raw transcript: speech, not code — body font, but keep its line breaks. */
 .raw { white-space: pre-wrap; overflow-wrap: break-word; }
+"""
+
+
+# Drives the live "Rerun cleanup" button: opens an SSE stream to /rerun (reusing
+# this page's ?f=<path> query), streams status lines into #rerun-log, and reloads
+# the page once the notes are rebuilt so the fresh summary is shown.
+TRANSCRIPT_JS = """
+(function () {
+  var btn = document.getElementById('rerun');
+  var log = document.getElementById('rerun-log');
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    btn.disabled = true;
+    btn.textContent = 'Rerunning\\u2026';
+    log.hidden = false;
+    log.textContent = '';
+    var done = false;
+    var es = new EventSource('/rerun' + location.search);
+    function line(text) { log.textContent += text + '\\n'; log.scrollTop = log.scrollHeight; }
+    es.onmessage = function (e) { line(e.data); };
+    es.addEventListener('done', function (e) {
+      done = true; es.close();
+      if (e.data === 'ok') { line('Reloading\\u2026'); setTimeout(function () { location.reload(); }, 800); }
+      else {
+        line('Cleanup failed \\u2014 existing notes kept.');
+        btn.disabled = false; btn.textContent = 'Rerun cleanup';
+      }
+    });
+    es.onerror = function () {
+      if (done) return;
+      done = true; es.close();
+      line('Lost connection to the recorder.');
+      btn.disabled = false; btn.textContent = 'Rerun cleanup';
+    };
+  });
+})();
 """
 
 
@@ -1971,8 +2026,15 @@ def rerun_cleanup(path: str | None, open_after: bool = False) -> int:
     return 0
 
 
-def render_transcript_html(md_file: Path) -> Path:
-    """Render a .meeting.md, plus the full transcript beside it, to one HTML page."""
+def transcript_page(md_file: Path, *, live: bool) -> str:
+    """Build the full HTML page for a .meeting.md plus the transcript beside it.
+
+    When `live`, the page is served over http:// and its "Rerun cleanup" button
+    opens an SSE stream to `/rerun`, showing progress in place and reloading when
+    the notes are rebuilt. When not, the page is a plain file:// document and the
+    button falls back to a clickable .command that opens Terminal — a static file
+    can neither run a shell command nor stream progress.
+    """
     md_text = md_file.read_text(encoding="utf-8", errors="replace")
     transcript_file, kind = full_transcript_for(md_file)
     tx_text = transcript_file.read_text(encoding="utf-8", errors="replace") if transcript_file else ""
@@ -1995,15 +2057,22 @@ def render_transcript_html(md_file: Path) -> Path:
         source_note = ""
 
     recorded = dt.datetime.fromtimestamp(md_file.stat().st_mtime).strftime("%a %d %b %Y, %H:%M")
-    rerun_cmd = rerun_cleanup_command_for(md_file)
-    out = RENDERED_DIR / f"{md_file.stem}.html"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(
+    if live:
+        rerun_control = (
+            "<button class='action' id='rerun' type='button'>Rerun cleanup</button>"
+            f"<script>{TRANSCRIPT_JS}</script>"
+        )
+    else:
+        rerun_cmd = rerun_cleanup_command_for(md_file)
+        rerun_control = f"<a class='action' href='{escape(rerun_cmd.as_uri())}'>Rerun cleanup</a>"
+
+    return (
         "<!doctype html>\n<html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>{escape(title)}</title><style>{TRANSCRIPT_CSS}</style></head><body>"
         "<nav class='nav'><a href='#summary'>Summary</a><a href='#transcript'>Full transcript</a>"
-        f"<span class='spacer'></span><a class='action' href='{escape(rerun_cmd.as_uri())}'>Rerun cleanup</a></nav>"
+        f"<span class='spacer'></span>{rerun_control}</nav>"
+        "<pre id='rerun-log' hidden></pre>"
         "<main>"
         f"<h1>{escape(title)}</h1>"
         f"<div class='meta'>{escape(recorded)} · {escape(md_file.parent.name)}</div>"
@@ -2011,9 +2080,15 @@ def render_transcript_html(md_file: Path) -> Path:
         "<section id='transcript'><h2 class='section-head'>Full transcript</h2>"
         f"{f'<div class=meta-inline>{source_note}</div>' if source_note else ''}"
         f"{transcript_html}</section>"
-        "</main></body></html>",
-        encoding="utf-8",
+        "</main></body></html>"
     )
+
+
+def render_transcript_html(md_file: Path) -> Path:
+    """Render a transcript to a standalone file:// page (used when no server)."""
+    out = RENDERED_DIR / f"{md_file.stem}.html"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(transcript_page(md_file, live=False), encoding="utf-8")
     return out
 
 
@@ -2028,6 +2103,10 @@ def open_transcript(path: str | None) -> int:
 
     Bare `open` on a .md hands it to whatever app claims markdown (VS Code here),
     which is an editor, not a reader — so render it and open the HTML instead.
+
+    Prefer a small localhost server so the page's "Rerun cleanup" button can
+    actually run cleanup and stream progress; fall back to a static file:// page
+    (button degrades to a clickable .command) if the server can't be started.
     """
     md_file = Path(path).expanduser() if path else latest_transcript()
     if md_file is None:
@@ -2036,9 +2115,191 @@ def open_transcript(path: str | None) -> int:
     if not md_file.exists():
         print(f"no such transcript: {display_path(md_file)}", file=sys.stderr)
         return 1
+    port = ensure_transcript_server()
+    if port:
+        url = f"http://127.0.0.1:{port}/t?f={urllib.parse.quote(str(md_file.resolve()))}"
+        subprocess.run(["/usr/bin/open", url], check=False)
+        return 0
     html = render_transcript_html(md_file)
     subprocess.run(["/usr/bin/open", str(html)], check=False)
     return 0
+
+
+def _valid_transcript_arg(raw: str | None) -> Path | None:
+    """Resolve a ?f= query value to a real .meeting.md under ROOT, or None.
+
+    The server executes cleanup on whatever path it's handed, so it must only ever
+    accept transcripts that actually live under the recordings root.
+    """
+    if not raw:
+        return None
+    try:
+        md_file = Path(raw).expanduser().resolve()
+        md_file.relative_to(ROOT.resolve())
+    except (ValueError, OSError):
+        return None
+    if md_file.name.endswith(".meeting.md") and md_file.exists():
+        return md_file
+    return None
+
+
+class _TranscriptHandler(BaseHTTPRequestHandler):
+    server_version = "MeetingRecorder/1"
+
+    def log_message(self, *args: object) -> None:  # noqa: D401 - silence stderr access log
+        pass
+
+    def _touch(self) -> None:
+        self.server.last_activity = time.time()  # type: ignore[attr-defined]
+
+    def do_GET(self) -> None:  # noqa: N802 - required name
+        self._touch()
+        parsed = urllib.parse.urlparse(self.path)
+        route = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
+        f = (query.get("f") or [None])[0]
+        if route == "/health":
+            self._send_text("ok")
+            return
+        if route == "/t":
+            md_file = _valid_transcript_arg(f)
+            if md_file is None:
+                self._send_text("no such transcript", status=404)
+                return
+            self._send_html(transcript_page(md_file, live=True))
+            return
+        if route == "/rerun":
+            md_file = _valid_transcript_arg(f)
+            if md_file is None:
+                self._send_text("no such transcript", status=404)
+                return
+            self._stream_rerun(md_file)
+            return
+        self._send_text("not found", status=404)
+
+    def _send_text(self, body: str, status: int = 200) -> None:
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_html(self, body: str) -> None:
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _stream_rerun(self, md_file: Path) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def emit(text: str) -> bool:
+            try:
+                self.wfile.write(f"data: {text}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return False
+
+        def emit_done(status: str) -> None:
+            try:
+                self.wfile.write(f"event: done\ndata: {status}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        emit(f"Re-running cleanup for {md_file.parent.name}…")
+        result: dict[str, int] = {}
+
+        def work() -> None:
+            result["code"] = rerun_cleanup(str(md_file), open_after=False)
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        # Claude runs for a minute or two with no incremental output of its own, so
+        # stream an elapsed-time heartbeat to show the page it's still working.
+        start = time.time()
+        while worker.is_alive():
+            worker.join(timeout=3)
+            self.server.last_activity = time.time()  # type: ignore[attr-defined]
+            if worker.is_alive():
+                if not emit(f"still working… {int(time.time() - start)}s"):
+                    return  # reader went away; let the worker finish in the background
+        emit_done("ok" if result.get("code") == 0 else "failed")
+
+
+def _run_transcript_server() -> int:
+    """Serve rendered transcripts on 127.0.0.1 until idle. Hidden subcommand."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _TranscriptHandler)
+    httpd.daemon_threads = True
+    httpd.last_activity = time.time()  # type: ignore[attr-defined]
+    port = httpd.server_address[1]
+    TRANSCRIPT_SERVER_FILE.write_text(
+        json.dumps({"port": port, "pid": os.getpid()}), encoding="utf-8"
+    )
+
+    def reap_when_idle() -> None:
+        while True:
+            time.sleep(60)
+            if time.time() - httpd.last_activity > TRANSCRIPT_SERVER_IDLE_SECONDS:  # type: ignore[attr-defined]
+                httpd.shutdown()
+                return
+
+    threading.Thread(target=reap_when_idle, daemon=True).start()
+    try:
+        httpd.serve_forever()
+    finally:
+        try:
+            if json.loads(TRANSCRIPT_SERVER_FILE.read_text()).get("pid") == os.getpid():
+                TRANSCRIPT_SERVER_FILE.unlink()
+        except (OSError, ValueError):
+            pass
+    return 0
+
+
+def _transcript_server_alive(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as resp:
+            return resp.read().strip() == b"ok"
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def ensure_transcript_server() -> int | None:
+    """Return the port of a running transcript server, starting one if needed."""
+    try:
+        state = json.loads(TRANSCRIPT_SERVER_FILE.read_text(encoding="utf-8"))
+        port = int(state["port"])
+        if _transcript_server_alive(port):
+            return port
+    except (OSError, ValueError, KeyError):
+        pass
+    # Stale or missing — start a fresh detached server and wait for it to bind.
+    cmd = [sys.executable, str(Path(__file__).resolve()), "serve-transcripts"]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        return None
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            state = json.loads(TRANSCRIPT_SERVER_FILE.read_text(encoding="utf-8"))
+            port = int(state["port"])
+            if _transcript_server_alive(port):
+                return port
+        except (OSError, ValueError, KeyError):
+            pass
+        time.sleep(0.15)
+    return None
 
 
 def print_engine(as_json: bool = False, max_age: int = 0) -> int:
@@ -2390,6 +2651,7 @@ def main() -> int:
     sub.add_parser("stop-recording", help="stop the current recording (manual OR watcher) and transcribe it")
     daemon = sub.add_parser("record-daemon", help=argparse.SUPPRESS)
     daemon.add_argument("label", nargs="?", default="manual-meeting")
+    sub.add_parser("serve-transcripts", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.command == "watch":
@@ -2399,6 +2661,8 @@ def main() -> int:
         return print_engine(as_json=args.json, max_age=args.max_age)
     if args.command == "open-transcript":
         return open_transcript(args.path)
+    if args.command == "serve-transcripts":
+        return _run_transcript_server()
     if args.command == "rerun-cleanup":
         return rerun_cleanup(args.path, open_after=args.open)
     if args.command == "doctor":

@@ -174,11 +174,14 @@ full transcript below, with a jump link between them. Where the cleanup wrote a
 separate `<stem>-cleaned.md` that speaker-attributed version is used; otherwise the
 raw `<stem>.txt` is shown as prose.
 
-Rendered pages include a **Rerun cleanup** button. It opens a small generated
-`.command` file that retries only the Claude cleanup pass against the existing
-raw transcript, then reopens the rendered page. If Claude is still unavailable or
+Rendered pages include a **Rerun cleanup** button. `open-transcript` serves the
+page from a small localhost server (`127.0.0.1`, started on demand, exits itself
+after a few idle hours), so the button retries only the Claude cleanup pass
+against the existing raw transcript, streams its progress into the page, and
+reloads with the fresh notes when it finishes. If Claude is still unavailable or
 rate limited, the current notes are left untouched and the failure is written to
-the meeting's `.claude.log`.
+the meeting's `.claude.log`. If the server can't start, the page falls back to a
+plain `file://` document whose button is a clickable `.command` instead.
 
 This exists because `open`-ing a `.md` hands it to whichever app has claimed
 markdown on your Mac — typically an *editor* (VS Code), which is the wrong tool for
