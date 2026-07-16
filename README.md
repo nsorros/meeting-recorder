@@ -101,6 +101,27 @@ the usual cause is the system output device being reset away from the
 Multi-Output/BlackHole loopback after a reboot, so nothing reaches the recorder.
 Set `MEETING_RECORDER_SILENCE_DB=` (empty) to disable the check.
 
+### Where the OpenRouter money goes
+
+Each OpenRouter transcription call is billed a real amount, and the account's
+balance is shared with other tools (the ant app). To make spend attributable,
+every transcription call is logged to a local SQLite ledger
+(`~/.local/state/meeting-recorder/openrouter-costs.db`) with the cost OpenRouter
+actually charged — we send `usage: {include: true}` and record the returned
+`usage.cost`, so the numbers reconcile against the dashboard rather than
+estimating from a price list. `mrec costs` reports the trailing window:
+
+```sh
+$ mrec costs
+OpenRouter spend (meeting-recorder, last 24h): $0.1840 over 6 call(s)
+  google/gemini-2.5-flash: $0.1840  (6 calls, 214,300 tokens)
+```
+
+`--hours N` widens the window and `--json` emits the same figures for the menu
+bar, which merges this ledger with the ant app's own `llm_calls` to show where
+the account's OpenRouter costs came from in the last 24h. Logging is best-effort:
+a ledger write never blocks or fails a transcription.
+
 ## Audio Setup
 
 There are two capture backends, selected by `MEETING_RECORDER_CAPTURE_BACKEND` (default `auto`):

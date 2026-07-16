@@ -19,6 +19,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,11 @@ TRANSCRIPT_SERVER_IDLE_SECONDS = 3 * 60 * 60
 # here so every process reads the same settings. Holds the env-file path, never
 # the key itself (see openrouter_api_key()).
 CONFIG_FILE = STATE_DIR / "config.json"
+# One SQLite row per OpenRouter transcription call, carrying the cost OpenRouter
+# actually billed (we send `usage: {include: true}`). This is the local half of
+# the "where do my OpenRouter costs go?" picture: the menu bar reads it alongside
+# ant's own llm_calls to break the account's spend down by source. See cost_db().
+COST_DB = STATE_DIR / "openrouter-costs.db"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 # Notification logo: osascript notifications are locked to the generic script
 # icon, so when terminal-notifier is installed we route through it with -appIcon
@@ -1292,9 +1298,89 @@ def transcription_plan(*, max_age: int = 0) -> dict:
     return {**openrouter, "credits": credits, "reason": "key present, credits available", "warning": warning}
 
 
-def openrouter_transcribe_chunk(mp3: Path, key: str) -> str:
+def cost_db() -> sqlite3.Connection:
+    """Open (creating on first use) the local OpenRouter-cost ledger.
+
+    WAL mode so the once-a-minute menu bar can read while a transcription is
+    writing. Every caller is best-effort — a telemetry failure must never be the
+    reason a transcription fails, so callers wrap this in try/except.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(COST_DB, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS openrouter_costs ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " created_at TEXT NOT NULL,"        # ISO8601 UTC, second precision
+        " source TEXT NOT NULL,"            # always 'meeting-recorder' here
+        " kind TEXT NOT NULL,"              # 'transcription'
+        " model TEXT,"
+        " meeting TEXT,"                    # recording folder name it belonged to
+        " chunk INTEGER,"                   # which audio chunk of that meeting
+        " prompt_tokens INTEGER DEFAULT 0,"
+        " completion_tokens INTEGER DEFAULT 0,"
+        " total_tokens INTEGER DEFAULT 0,"
+        " cost REAL DEFAULT 0.0)")          # USD, as billed by OpenRouter
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_costs_created ON openrouter_costs (created_at)")
+    return conn
+
+
+def record_openrouter_cost(*, model: str, usage: dict | None, meeting: str | None = None,
+                           chunk: int | None = None, kind: str = "transcription",
+                           source: str = "meeting-recorder") -> None:
+    """Append one row for an OpenRouter call. Best-effort; never raises."""
+    usage = usage or {}
+    try:
+        details = usage.get("prompt_tokens_details") or {}
+        pt = int(usage.get("prompt_tokens") or 0)
+        ct = int(usage.get("completion_tokens") or 0)
+        tt = int(usage.get("total_tokens") or (pt + ct))
+        cost = float(usage.get("cost") or 0.0)
+        conn = cost_db()
+        with conn:
+            conn.execute(
+                "INSERT INTO openrouter_costs (created_at, source, kind, model, meeting, chunk,"
+                " prompt_tokens, completion_tokens, total_tokens, cost)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), source, kind,
+                 model, meeting, chunk, pt, ct, tt, cost))
+        conn.close()
+    except Exception as exc:  # telemetry must not break transcription
+        log(f"openrouter cost log failed: {exc}")
+
+
+def costs_summary(hours: int = 24) -> dict:
+    """Local OpenRouter spend over the trailing `hours`, grouped by model.
+
+    The shape mirrors ant's llm_costs so the menu bar can merge the two sources
+    into one "where do costs happen" view.
+    """
+    empty = {"hours": hours, "source": "meeting-recorder", "total_cost": 0.0,
+             "calls": 0, "by_model": []}
+    since = (dt.datetime.now(dt.timezone.utc)
+             - dt.timedelta(hours=hours)).isoformat(timespec="seconds")
+    try:
+        conn = cost_db()
+        rows = conn.execute(
+            "SELECT model, COUNT(*), SUM(cost), SUM(total_tokens)"
+            " FROM openrouter_costs WHERE created_at >= ?"
+            " GROUP BY model ORDER BY SUM(cost) DESC", (since,)).fetchall()
+        conn.close()
+    except Exception as exc:
+        log(f"openrouter cost summary failed: {exc}")
+        return empty
+    by_model = [{"model": r[0], "calls": int(r[1] or 0), "cost": round(float(r[2] or 0.0), 6),
+                 "tokens": int(r[3] or 0)} for r in rows]
+    return {"hours": hours, "source": "meeting-recorder",
+            "total_cost": round(sum(m["cost"] for m in by_model), 6),
+            "calls": sum(m["calls"] for m in by_model), "by_model": by_model}
+
+
+def openrouter_transcribe_chunk(mp3: Path, key: str) -> tuple[str, dict]:
     """Transcribe one mp3 chunk via the OpenRouter chat/completions audio API.
 
+    Returns (transcript_text, usage) where `usage` is OpenRouter's usage block
+    (it carries `cost` because we ask for it below); usage is {} if absent.
     Raises on auth/credit failures (401/402/403) and on exhausted retries so the
     caller can fall back to local Whisper.
     """
@@ -1309,6 +1395,10 @@ def openrouter_transcribe_chunk(mp3: Path, key: str) -> str:
             {"type": "input_audio", "input_audio": {"data": data_b64, "format": "mp3"}},
         ]}],
         "temperature": 0,
+        # Ask OpenRouter to return what it billed. Without this the usage block
+        # has token counts but no `cost`, and we'd be back to estimating spend
+        # from a price list instead of recording the authoritative figure.
+        "usage": {"include": True},
     }).encode("utf-8")
     url = OPENROUTER_BASE_URL.rstrip("/") + "/chat/completions"
     last_exc: Exception | None = None
@@ -1322,7 +1412,8 @@ def openrouter_transcribe_chunk(mp3: Path, key: str) -> str:
                 payload = json.loads(resp.read().decode("utf-8"))
             if payload.get("error"):
                 raise RuntimeError(str(payload["error"])[:300])
-            return payload["choices"][0]["message"].get("content") or ""
+            return (payload["choices"][0]["message"].get("content") or "",
+                    payload.get("usage") or {})
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
             # Auth/credit problems won't fix themselves — fail now to trigger fallback.
@@ -1367,10 +1458,15 @@ def transcribe_with_openrouter(audio: Path, out_dir: Path) -> Path:
             )
             if enc.returncode != 0 or not mp3.exists() or mp3.stat().st_size < 512:
                 continue  # trailing/empty segment
-            text = openrouter_transcribe_chunk(mp3, key).strip()
+            text, usage = openrouter_transcribe_chunk(mp3, key)
+            text = text.strip()
+            # The call was billed whether or not it returned text — record it.
+            record_openrouter_cost(model=OPENROUTER_MODEL, usage=usage,
+                                   meeting=out_dir.name, chunk=idx)
             if text:
                 parts.append(text)
-            log(f"openrouter chunk {idx + 1}/{nchunks} done ({len(text)} chars)")
+            cost = float((usage or {}).get("cost") or 0.0)
+            log(f"openrouter chunk {idx + 1}/{nchunks} done ({len(text)} chars, ${cost:.4f})")
     if not parts:
         raise RuntimeError("openrouter returned no transcript text")
     raw_txt = out_dir / f"{audio.stem}.txt"
@@ -2321,6 +2417,22 @@ def print_engine(as_json: bool = False, max_age: int = 0) -> int:
     return 1 if (degraded or plan["warning"]) else 0
 
 
+def print_costs(as_json: bool = False, hours: int = 24) -> int:
+    """Show local OpenRouter transcription spend over the trailing `hours`."""
+    summ = costs_summary(hours=hours)
+    if as_json:
+        print(json.dumps(summ))
+        return 0
+    print(f"OpenRouter spend (meeting-recorder, last {hours}h): "
+          f"${summ['total_cost']:.4f} over {summ['calls']} call(s)")
+    for m in summ["by_model"]:
+        print(f"  {m['model']}: ${m['cost']:.4f}  "
+              f"({m['calls']} calls, {m['tokens']:,} tokens)")
+    if not summ["by_model"]:
+        print("  (no OpenRouter calls recorded yet — transcribe a meeting first)")
+    return 0
+
+
 def doctor() -> int:
     ok = True
     for binary in ("ffmpeg", "whisper", "claude", "osascript"):
@@ -2630,6 +2742,9 @@ def main() -> int:
     engine.add_argument("--json", action="store_true", help="machine-readable output")
     engine.add_argument("--max-age", type=int, default=0,
                         help="accept a cached credits reading up to N seconds old (default: always fresh)")
+    costs = sub.add_parser("costs", help="show local OpenRouter transcription spend (last 24h by default)")
+    costs.add_argument("--json", action="store_true", help="machine-readable output")
+    costs.add_argument("--hours", type=int, default=24, help="trailing window in hours (default: 24)")
     open_tx = sub.add_parser("open-transcript", help="open a transcript rendered in the browser (default: the newest)")
     open_tx.add_argument("path", nargs="?", help="path to a .meeting.md (default: most recent)")
     retry = sub.add_parser("rerun-cleanup", help="rerun Claude cleanup for a transcript without retranscribing audio")
@@ -2659,6 +2774,8 @@ def main() -> int:
         return 0
     if args.command == "engine":
         return print_engine(as_json=args.json, max_age=args.max_age)
+    if args.command == "costs":
+        return print_costs(as_json=args.json, hours=args.hours)
     if args.command == "open-transcript":
         return open_transcript(args.path)
     if args.command == "serve-transcripts":
