@@ -1564,10 +1564,10 @@ Produce markdown with:
 - Title inferred from content if possible
 - Date/time from the filename if useful
 - Speakers legend (label -> who they are, as far as identifiable)
-- Cleaned transcript as attributed turns in the form "**Name:** text", preserving meaning and uncertainty
 - Decisions
 - Action items with owner if identifiable
 - Open questions
+- Cleaned transcript as attributed turns in the form "**Name:** text", preserving meaning and uncertainty (put this last, just before the full transcript)
 
 Do not invent details not supported by the raw transcript. Attribution should be
 your best supported reading; flag it as uncertain rather than fabricating names.
