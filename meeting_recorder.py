@@ -167,6 +167,8 @@ def write_persisted_config() -> None:
     CONFIG_FILE.write_text(json.dumps({
         "transcribe_engine": TRANSCRIBE_ENGINE,
         "openrouter_model": OPENROUTER_MODEL,
+        "cleanup_engine": CLEANUP_ENGINE,
+        "openrouter_cleanup_model": OPENROUTER_CLEANUP_MODEL,
         "openrouter_env_file": str(Path(OPENROUTER_ENV_FILE).expanduser()) if OPENROUTER_ENV_FILE else "",
         # The daemon's PATH reaches ffmpeg; a GUI-launched process's does not.
         # See _augment_path_from_config().
@@ -227,6 +229,30 @@ OPENROUTER_CREDITS_TIMEOUT = int(os.environ.get("MEETING_RECORDER_OPENROUTER_CRE
 # up. Roughly: $0.12 buys an hour of audio on Gemini Flash.
 LOW_CREDIT_USD = float(os.environ.get("MEETING_RECORDER_LOW_CREDIT_USD", "2") or 0)
 USD_PER_AUDIO_HOUR = 0.12
+
+
+# --- Cleanup engine ------------------------------------------------------
+# Turning the raw transcript into attributed notes is a second LLM pass. It used
+# to run only through `claude -p`, which is free against a Claude subscription
+# but spends that subscription's usage allowance — the cost lands as rate limits
+# in Claude Code rather than as dollars. "openrouter" (default) moves the pass
+# onto the same account and client the transcription already uses: measured over
+# a month of real meetings it is ~$0.02 per meeting (~$1.30/month at ~60), which
+# buys the allowance back. Falls back to `claude -p` on any OpenRouter failure,
+# mirroring how transcription falls back to local Whisper. Set to "claude" to
+# force the old behaviour.
+CLEANUP_ENGINE = _setting("MEETING_RECORDER_CLEANUP_ENGINE", "cleanup_engine", "openrouter").lower()
+OPENROUTER_CLEANUP_MODEL = _setting(
+    "MEETING_RECORDER_OPENROUTER_CLEANUP_MODEL", "openrouter_cleanup_model", "google/gemini-2.5-flash")
+# The cleanup reproduces the whole transcript as attributed turns, so output is
+# the same order of magnitude as input — a low cap silently truncates the notes.
+# Gemini Flash tops out at 65k completion tokens.
+OPENROUTER_CLEANUP_MAX_TOKENS = int(
+    os.environ.get("MEETING_RECORDER_OPENROUTER_CLEANUP_MAX_TOKENS", "65536"))
+# Cleanup sends the entire transcript in one request and reasons over it, so it
+# runs a good deal longer than a 10-minute audio chunk.
+OPENROUTER_CLEANUP_TIMEOUT = int(
+    os.environ.get("MEETING_RECORDER_OPENROUTER_CLEANUP_TIMEOUT", "900"))
 # Silence guard: a reboot can reset the default output device away from the
 # Multi-Output/BlackHole loopback, so ffmpeg captures pure digital silence.
 # Recordings at or below this mean dBFS abort with an actionable error instead
@@ -1527,13 +1553,12 @@ def write_basic_meeting_md(raw_txt: Path, final_md: Path, audio: Path) -> None:
     )
 
 
-def clean_with_claude(
-    raw_txt: Path,
-    final_md: Path,
-    audio: Path,
-    diarized_txt: Path | None = None,
-    preserve_on_failure: bool = False,
-) -> bool:
+def build_cleanup_prompt(raw_txt: Path, audio: Path, diarized_txt: Path | None = None) -> str:
+    """The cleanup instruction plus the transcript, shared by both engines.
+
+    Kept engine-agnostic so `claude -p` and OpenRouter clean identically — the
+    fallback must not silently change the shape of the notes.
+    """
     transcript_text = raw_txt.read_text(encoding="utf-8", errors="replace")
     if diarized_txt is not None:
         speaker_note = (
@@ -1575,6 +1600,123 @@ your best supported reading; flag it as uncertain rather than fabricating names.
 Raw transcript:
 {transcript_text}
 """.strip()
+    return prompt
+
+
+class CleanupUnusable(RuntimeError):
+    """The call succeeded but the output is unusable, and retrying won't help.
+
+    Currently only the output-cap case: the same prompt produces the same
+    over-long answer every time, and each attempt is billed.
+    """
+
+
+# The cleanup prompt asks for the full transcript back as attributed turns, so a
+# good result is roughly as long as its input (observed ratio ~1.05). Gemini
+# Flash intermittently returns an aborted generation instead — a few hundred
+# bytes, `finish_reason: "stop"`, and no usage block, so nothing about the
+# response says "error". Observed live: three identical requests returned 18
+# chars, then 28272, then 28272. Anything under this share of the input is
+# treated as a failed generation and retried.
+CLEANUP_MIN_OUTPUT_RATIO = float(
+    os.environ.get("MEETING_RECORDER_CLEANUP_MIN_OUTPUT_RATIO", "0.4") or 0)
+
+
+def clean_with_openrouter(prompt: str, meeting: str, transcript_chars: int = 0) -> str:
+    """Run the cleanup prompt through OpenRouter. Returns the notes markdown.
+
+    `transcript_chars` is the length of the raw transcript, used to spot the
+    aborted generations described at CLEANUP_MIN_OUTPUT_RATIO. Raises on
+    auth/credit failures, exhausted retries, or an uncorrectably bad completion,
+    so the caller can fall back to `claude -p`.
+    """
+    key = openrouter_api_key()
+    body = json.dumps({
+        "model": OPENROUTER_CLEANUP_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": OPENROUTER_CLEANUP_MAX_TOKENS,
+        # As in transcription: ask for the billed figure so the ledger records
+        # what OpenRouter actually charged rather than a price-list estimate.
+        "usage": {"include": True},
+    }).encode("utf-8")
+    url = OPENROUTER_BASE_URL.rstrip("/") + "/chat/completions"
+    last_exc: Exception | None = None
+    for attempt in range(OPENROUTER_MAX_RETRIES):
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=OPENROUTER_CLEANUP_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            if payload.get("error"):
+                raise RuntimeError(str(payload["error"])[:300])
+            choice = (payload.get("choices") or [{}])[0]
+            text = (choice.get("message") or {}).get("content") or ""
+            usage = payload.get("usage") or {}
+            record_openrouter_cost(model=OPENROUTER_CLEANUP_MODEL, usage=usage,
+                                   meeting=meeting, kind="cleanup")
+            # Hitting the output cap is deterministic — the same prompt will
+            # overrun again, so fall back rather than pay for identical retries.
+            if choice.get("finish_reason") == "length":
+                raise CleanupUnusable(
+                    f"openrouter cleanup hit the {OPENROUTER_CLEANUP_MAX_TOKENS}-token output cap "
+                    "(notes would be truncated)")
+            floor = int(transcript_chars * CLEANUP_MIN_OUTPUT_RATIO)
+            if not text.strip() or len(text) < floor:
+                # Transient: a rerun of the identical prompt usually succeeds.
+                last_exc = RuntimeError(
+                    f"openrouter returned a short cleanup ({len(text)} chars, expected >{floor} "
+                    f"for a {transcript_chars}-char transcript) — likely an aborted generation")
+                log(f"{last_exc}; retrying")
+                time.sleep(2 * (attempt + 1))
+                continue
+            cost = float(usage.get("cost") or 0.0)
+            log(f"openrouter cleanup done ({len(text)} chars, ${cost:.4f})")
+            return text
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            # Auth/credit problems won't fix themselves — fail now to trigger fallback.
+            if exc.code in (401, 402, 403):
+                raise RuntimeError(f"openrouter HTTP {exc.code}: {detail}")
+            last_exc = RuntimeError(f"openrouter HTTP {exc.code}: {detail}")
+        except CleanupUnusable:
+            raise
+        except Exception as exc:
+            last_exc = exc
+        time.sleep(2 * (attempt + 1))
+    raise last_exc or RuntimeError("openrouter cleanup request failed")
+
+
+def clean_with_claude(
+    raw_txt: Path,
+    final_md: Path,
+    audio: Path,
+    diarized_txt: Path | None = None,
+    preserve_on_failure: bool = False,
+) -> bool:
+    """Clean the transcript into notes at `final_md`. Returns True on success.
+
+    Dispatches on CLEANUP_ENGINE, falling back from OpenRouter to `claude -p`
+    the same way transcription falls back to local Whisper. Named for the
+    subprocess it originally wrapped; kept for callers and the .claude.log path.
+    """
+    prompt = build_cleanup_prompt(raw_txt, audio, diarized_txt=diarized_txt)
+
+    if CLEANUP_ENGINE == "openrouter":
+        log_section("openrouter cleanup started", model=OPENROUTER_CLEANUP_MODEL,
+                    raw_transcript=display_path(raw_txt), final_notes=display_path(final_md))
+        try:
+            notes = clean_with_openrouter(
+                prompt, meeting=final_md.stem,
+                transcript_chars=len((diarized_txt or raw_txt).read_text(encoding="utf-8", errors="replace")),
+            )
+            final_md.write_text(notes, encoding="utf-8")
+            return True
+        except Exception as exc:
+            log(f"openrouter cleanup failed ({exc}); falling back to claude -p")
+
     cmd = ["claude", "-p"]
     if CLAUDE_MODEL:
         cmd.extend(["--model", CLAUDE_MODEL])
@@ -2437,13 +2579,22 @@ def doctor() -> int:
     ok = True
     for binary in ("ffmpeg", "whisper", "claude", "osascript"):
         exists = command_exists(binary)
-        print(f"{binary}: {'ok' if exists else 'missing'}")
-        ok = ok and exists
+        # With cleanup on OpenRouter, `claude` is only the fallback path — a
+        # missing binary is worth flagging but is not a broken install.
+        optional = binary == "claude" and CLEANUP_ENGINE == "openrouter"
+        note = "" if exists else ("  (optional — cleanup fallback only)" if optional else "")
+        print(f"{binary}: {'ok' if exists else 'missing'}{note}")
+        ok = ok and (exists or optional)
     print(f"recordings: {ROOT}")
     print(f"log: {LOG}")
 
     print("\ntranscription:")
     print_engine()
+
+    print(f"\ncleanup engine: {CLEANUP_ENGINE}"
+          + (f" ({OPENROUTER_CLEANUP_MODEL})" if CLEANUP_ENGINE == "openrouter" else ""))
+    if DISABLE_CLAUDE:
+        print("cleanup: disabled (MEETING_RECORDER_DISABLE_CLAUDE) — raw transcript only")
 
     print(f"\ncapture backend: {CAPTURE_BACKEND}")
     if CAPTURE_BACKEND in ("auto", "screencapturekit", "sck"):

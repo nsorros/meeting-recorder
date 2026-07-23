@@ -6,9 +6,9 @@ Local macOS meeting recorder:
 2. asks before recording
 3. records the configured macOS audio input with `ffmpeg` as `.wav`
 4. transcribes via **OpenRouter** (cloud; seconds per file) with automatic fallback to local `whisper`
-5. optionally asks `claude -p` to clean the raw transcript into notes
+5. optionally cleans the raw transcript into notes via OpenRouter (falling back to `claude -p`)
 
-`claude -p` is not used as the speech recognizer. OpenRouter (or local Whisper) does the audio transcription. Claude is only the cleanup/summary pass.
+Neither pass uses `claude -p` as the speech recognizer. OpenRouter (or local Whisper) does the audio transcription; a second OpenRouter call does the cleanup/summary pass, with `claude -p` as its fallback.
 
 ## Commands
 
@@ -161,25 +161,60 @@ export MEETING_RECORDER_AUDIO_DEVICE="1"
 
 If `ffmpeg` cannot see any audio devices, grant microphone permission to your terminal app in System Settings.
 
-## Claude Cleanup
+## Cleanup
 
-By default, the raw Whisper transcript is cleaned with:
+Turning the raw transcript into attributed notes is a second LLM pass. By
+default it runs on **OpenRouter** (`google/gemini-2.5-flash`) — the same account
+and client used for transcription — at roughly **$0.02 per meeting** (~$1.30/month
+at ~60 meetings). It used to run through `claude -p`, which is free against a
+Claude subscription but spends that subscription's usage allowance; moving the
+pass to OpenRouter buys the allowance back for a small, visible dollar cost.
+
+`claude -p` remains the automatic fallback: if OpenRouter has no key, no credit,
+or fails, cleanup falls back to it exactly as transcription falls back to local
+Whisper. Cleanup spend is recorded in the same ledger as transcription and shows
+up under `mrec costs` as `kind=cleanup`.
+
+Force the old behaviour:
 
 ```sh
-claude -p
+export MEETING_RECORDER_CLEANUP_ENGINE=claude
 ```
 
-Disable that and keep the raw transcript wrapped in markdown:
+Pick a different OpenRouter model for the cleanup pass:
+
+```sh
+export MEETING_RECORDER_OPENROUTER_CLEANUP_MODEL=google/gemini-2.5-flash-lite
+```
+
+Disable cleanup entirely and keep the raw transcript wrapped in markdown:
 
 ```sh
 export MEETING_RECORDER_DISABLE_CLAUDE=1
 ```
 
-Choose a Claude model:
+Choose a Claude model for the fallback path:
 
 ```sh
 export MEETING_RECORDER_CLAUDE_MODEL=sonnet
 ```
+
+### Short-output guard
+
+Gemini Flash intermittently returns an *aborted* generation — a few hundred bytes
+with `finish_reason: "stop"` and no usage block, so nothing about the response
+says "error". Observed live: three identical requests returned 18 chars, then
+28272, then 28272. Because the cleanup prompt asks for the whole transcript back
+as attributed turns, a good result is roughly as long as its input, so any
+response shorter than 40% of the transcript is treated as a failed generation and
+retried (then falls back to `claude -p`). Tune with:
+
+```sh
+export MEETING_RECORDER_CLEANUP_MIN_OUTPUT_RATIO=0.4
+```
+
+Without this guard the truncated response overwrites your notes and looks like a
+successful run.
 
 ## Reading Transcripts
 
@@ -364,8 +399,13 @@ Environment variables:
 - `MEETING_RECORDER_NO_SPEECH_THRESHOLD`: probability above which a segment is treated as silence and dropped. Default: `0.6`.
 - `MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD`: seconds — skip silent stretches longer than this when a hallucination is detected (needs word timestamps, which the tool enables automatically). Default: `2`. Set to empty to disable.
 - `MEETING_RECORDER_NO_LOGO`: set to `1` to post notifications via osascript (generic icon) instead of the native notifier app. See **Notification Logo**.
-- `MEETING_RECORDER_DISABLE_CLAUDE`: set to `1` to skip Claude cleanup.
-- `MEETING_RECORDER_CLAUDE_MODEL`: optional Claude model alias.
+- `MEETING_RECORDER_DISABLE_CLAUDE`: set to `1` to skip the cleanup pass.
+- `MEETING_RECORDER_CLAUDE_MODEL`: optional Claude model alias (fallback path).
+- `MEETING_RECORDER_CLEANUP_ENGINE`: `openrouter` (default) or `claude`.
+- `MEETING_RECORDER_OPENROUTER_CLEANUP_MODEL`: cleanup model (default `google/gemini-2.5-flash`).
+- `MEETING_RECORDER_OPENROUTER_CLEANUP_MAX_TOKENS`: output cap (default `65536`).
+- `MEETING_RECORDER_OPENROUTER_CLEANUP_TIMEOUT`: seconds per cleanup request (default `900`).
+- `MEETING_RECORDER_CLEANUP_MIN_OUTPUT_RATIO`: short-output guard (default `0.4`).
 - `MEETING_RECORDER_DIARIZE`: set to `1` to enable acoustic speaker diarization via whisperx (needs whisperx + `HF_TOKEN`). See **Speaker Labels**.
 - `MEETING_RECORDER_CALENDAR`: set to `0` to skip the calendar lookup when naming a recording (see **Meeting Names**). Default: `1`.
 - `MEETING_RECORDER_CALENDAR_ACCOUNTS`: comma-separated `client=account` pairs passed to `gog` for the calendar lookup (either side may be blank for gog's default). Default: `=,finant=nick@finant.ai` (mantis + finant).
