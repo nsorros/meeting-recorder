@@ -125,6 +125,10 @@ RECORDER_SRC = Path(__file__).resolve().parent / "recorder" / "main.swift"
 RECORDER_BIN = Path(
     os.environ.get("MEETING_RECORDER_SCK_BIN", str(Path(__file__).resolve().parent / "bin" / "sck-recorder"))
 ).expanduser()
+MIC_PROBE_SRC = Path(__file__).resolve().parent / "recorder" / "mic.swift"
+MIC_PROBE_BIN = Path(
+    os.environ.get("MEETING_RECORDER_MIC_BIN", str(Path(__file__).resolve().parent / "bin" / "mic-probe"))
+).expanduser()
 POLL_SECONDS = int(os.environ.get("MEETING_RECORDER_POLL_SECONDS", "10"))
 END_GRACE_SECONDS = int(os.environ.get("MEETING_RECORDER_END_GRACE_SECONDS", "45"))
 CHECK_IN_SECONDS = int(os.environ.get("MEETING_RECORDER_CHECK_IN_SECONDS", "1800"))
@@ -316,6 +320,30 @@ PROCESS_HINTS = (
     ("Microsoft Teams", "Microsoft Teams"),
     ("com.microsoft.teams", "Microsoft Teams"),
 )
+
+# Apps whose calls leave no browser tab and no distinctive process: Slack runs
+# all day whether or not you are in a huddle, so presence in `ps` proves nothing.
+# These are matched against processes *currently holding a mic input stream*
+# instead — see mic_input_holders().
+#
+# Deliberately an allowlist. Treating any mic use as a meeting would start a
+# recording whenever you dictate a message or open Voice Memos; for an always-on
+# recorder of real conversations, a missed huddle is a cheaper mistake than an
+# unexpected recording. Add an entry per app you want covered.
+MIC_HINTS = (
+    ("Slack", "Slack Huddle"),
+    ("Discord", "Discord Call"),
+    ("FaceTime", "FaceTime"),
+)
+# Our own capture holds the mic for as long as it records, so a detector that
+# trusted mic-in-use blindly would see itself, conclude a meeting was still in
+# progress, and never stop. These are excluded by name; see mic_input_holders().
+MIC_SELF_PROCESSES = ("ffmpeg", "sck-recorder", "replayd", "coreaudiod")
+# Detection runs every POLL_SECONDS; the probe is a subprocess, so cache briefly
+# to keep repeat calls within one poll cheap.
+MIC_PROBE_CACHE_SECONDS = float(os.environ.get("MEETING_RECORDER_MIC_CACHE_SECONDS", "3") or 0)
+# Set to 0/false to skip mic-based detection entirely.
+MIC_DETECT = os.environ.get("MEETING_RECORDER_MIC_DETECT", "1").lower() not in {"0", "false", "no"}
 
 TITLE_HINTS = (
     "Google Meet",
@@ -663,6 +691,65 @@ def browser_tabs() -> list[tuple[str, str, str]]:
     return found
 
 
+def ensure_mic_probe_built() -> Path:
+    """Compile recorder/mic.swift into the mic-probe helper if needed.
+
+    Same rebuild-when-stale contract as ensure_recorder_built(); raises so
+    callers can degrade to the tab/process detectors.
+    """
+    if not MIC_PROBE_SRC.exists():
+        raise RuntimeError(f"missing mic probe source: {MIC_PROBE_SRC}")
+    if MIC_PROBE_BIN.exists() and MIC_PROBE_BIN.stat().st_mtime >= MIC_PROBE_SRC.stat().st_mtime:
+        return MIC_PROBE_BIN
+    if not command_exists("xcrun"):
+        raise RuntimeError("Xcode command line tools required (xcrun not found); run: xcode-select --install")
+    MIC_PROBE_BIN.parent.mkdir(parents=True, exist_ok=True)
+    res = run(["xcrun", "swiftc", "-O", str(MIC_PROBE_SRC), "-o", str(MIC_PROBE_BIN),
+               "-framework", "CoreAudio"], timeout=180)
+    if res.returncode != 0:
+        raise RuntimeError(f"swiftc failed: {res.stderr.strip() or res.stdout.strip()}")
+    MIC_PROBE_BIN.chmod(0o755)
+    return MIC_PROBE_BIN
+
+
+_MIC_CACHE: tuple[float, list[tuple[int, str]]] | None = None
+
+
+def mic_input_holders(*, use_cache: bool = True) -> list[tuple[int, str]]:
+    """Processes currently holding a microphone input stream, as (pid, name).
+
+    Excludes our own capture stack: while recording, ffmpeg/sck-recorder hold the
+    mic, and counting them would make the recorder detect itself and never stop.
+    Returns [] on any failure — mic detection is an addition to tab/process
+    detection, never a reason to lose a meeting the other paths would have found.
+    """
+    global _MIC_CACHE
+    now = time.monotonic()
+    if use_cache and _MIC_CACHE is not None and now - _MIC_CACHE[0] < MIC_PROBE_CACHE_SECONDS:
+        return _MIC_CACHE[1]
+    holders: list[tuple[int, str]] = []
+    try:
+        proc = run([str(ensure_mic_probe_built())], timeout=10)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or f"exit {proc.returncode}")
+        for line in proc.stdout.splitlines():
+            pid_text, _, name = line.partition("\t")
+            if not name.strip():
+                continue
+            # Our own capture, and the audio daemons that proxy it, are not meetings.
+            if any(s.lower() in name.lower() for s in MIC_SELF_PROCESSES):
+                continue
+            try:
+                holders.append((int(pid_text), name.strip()))
+            except ValueError:
+                continue
+    except Exception as exc:
+        log(f"mic probe unavailable ({exc}); relying on tab/process detection")
+        holders = []
+    _MIC_CACHE = (now, holders)
+    return holders
+
+
 def detect_meeting() -> str | None:
     for app, url, title in browser_tabs():
         haystack = f"{url} {title}".lower()
@@ -676,6 +763,14 @@ def detect_meeting() -> str | None:
         for hint, label in PROCESS_HINTS:
             if hint.lower() in process.lower():
                 return label
+
+    # Last: apps that only reveal a call by taking the mic (Slack huddles etc.).
+    # Checked after the cheaper detectors so a Meet tab still wins the label.
+    if MIC_DETECT:
+        for _pid, name in mic_input_holders():
+            for hint, label in MIC_HINTS:
+                if hint.lower() in name.lower():
+                    return label
     return None
 
 
@@ -1750,7 +1845,9 @@ def watch() -> None:
         whisper_model=WHISPER_MODEL,
         claude_cleanup="disabled" if DISABLE_CLAUDE else "enabled",
     )
-    notify("Meeting Recorder", "Watching for Meet, Zoom, Teams, Webex, and Whereby.")
+    notify("Meeting Recorder",
+           "Watching for Meet, Zoom, Teams, Webex, Whereby"
+           + (", and Slack huddles." if MIC_DETECT else "."))
     active = False
     declined_reason: str | None = None
     # The daemon is the process that holds the real OpenRouter settings (launchd
@@ -2575,6 +2672,38 @@ def print_costs(as_json: bool = False, hours: int = 24) -> int:
     return 0
 
 
+def print_mic_probe(watch_mode: bool = False, interval: float = 2.0) -> int:
+    """Show which processes hold the mic, and whether that reads as a meeting.
+
+    The point of `--watch` is to answer the question static inspection cannot:
+    start a huddle, mute yourself, and see whether Slack keeps the input stream.
+    If it releases the mic on mute, a muted stretch looks like the huddle ended.
+    """
+    try:
+        print(f"probe: {display_path(ensure_mic_probe_built())}")
+    except Exception as exc:
+        print(f"mic probe unavailable: {exc}", file=sys.stderr)
+        return 1
+    print(f"watching for: {', '.join(label for _h, label in MIC_HINTS)}")
+    print(f"ignoring our own capture: {', '.join(MIC_SELF_PROCESSES)}\n")
+    while True:
+        holders = mic_input_holders(use_cache=False)
+        stamp = dt.datetime.now().strftime("%H:%M:%S")
+        if holders:
+            for pid, name in holders:
+                match = next((label for hint, label in MIC_HINTS if hint.lower() in name.lower()), None)
+                print(f"[{stamp}] mic in use: {name} (pid {pid})"
+                      + (f"  -> would record as \"{match}\"" if match else "  (not a watched app)"))
+        else:
+            print(f"[{stamp}] no process is holding the microphone")
+        if not watch_mode:
+            return 0
+        try:
+            time.sleep(max(0.2, interval))
+        except KeyboardInterrupt:
+            return 0
+
+
 def doctor() -> int:
     ok = True
     for binary in ("ffmpeg", "whisper", "claude", "osascript"):
@@ -2595,6 +2724,19 @@ def doctor() -> int:
           + (f" ({OPENROUTER_CLEANUP_MODEL})" if CLEANUP_ENGINE == "openrouter" else ""))
     if DISABLE_CLAUDE:
         print("cleanup: disabled (MEETING_RECORDER_DISABLE_CLAUDE) — raw transcript only")
+
+    print("\nhuddle detection (mic-in-use):")
+    if not MIC_DETECT:
+        print("  disabled (MEETING_RECORDER_MIC_DETECT=0)")
+    else:
+        try:
+            ensure_mic_probe_built()
+            holders = mic_input_holders(use_cache=False)
+            print(f"  mic-probe: ok ({', '.join(label for _h, label in MIC_HINTS)})")
+            print("  mic in use now: "
+                  + (", ".join(f"{n} (pid {p})" for p, n in holders) if holders else "nothing"))
+        except Exception as exc:
+            print(f"  mic-probe: ⚠️  unavailable ({exc}) — huddles will not be detected")
 
     print(f"\ncapture backend: {CAPTURE_BACKEND}")
     if CAPTURE_BACKEND in ("auto", "screencapturekit", "sck"):
@@ -2893,6 +3035,9 @@ def main() -> int:
     engine.add_argument("--json", action="store_true", help="machine-readable output")
     engine.add_argument("--max-age", type=int, default=0,
                         help="accept a cached credits reading up to N seconds old (default: always fresh)")
+    mic = sub.add_parser("mic-probe", help="show which processes currently hold the microphone (huddle detection)")
+    mic.add_argument("--watch", action="store_true", help="poll continuously until interrupted")
+    mic.add_argument("--interval", type=float, default=2.0, help="seconds between polls with --watch (default: 2)")
     costs = sub.add_parser("costs", help="show local OpenRouter transcription spend (last 24h by default)")
     costs.add_argument("--json", action="store_true", help="machine-readable output")
     costs.add_argument("--hours", type=int, default=24, help="trailing window in hours (default: 24)")
@@ -2925,6 +3070,8 @@ def main() -> int:
         return 0
     if args.command == "engine":
         return print_engine(as_json=args.json, max_age=args.max_age)
+    if args.command == "mic-probe":
+        return print_mic_probe(watch_mode=args.watch, interval=args.interval)
     if args.command == "costs":
         return print_costs(as_json=args.json, hours=args.hours)
     if args.command == "open-transcript":

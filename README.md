@@ -2,7 +2,7 @@
 
 Local macOS meeting recorder:
 
-1. watches for Google Meet, Teams, Zoom, Webex, or Whereby in browsers/apps
+1. watches for Google Meet, Teams, Zoom, Webex, or Whereby in browsers/apps, plus Slack huddles (see [Huddle Detection](#huddle-detection))
 2. asks before recording
 3. records the configured macOS audio input with `ffmpeg` as `.wav`
 4. transcribes via **OpenRouter** (cloud; seconds per file) with automatic fallback to local `whisper`
@@ -10,10 +10,59 @@ Local macOS meeting recorder:
 
 Neither pass uses `claude -p` as the speech recognizer. OpenRouter (or local Whisper) does the audio transcription; a second OpenRouter call does the cleanup/summary pass, with `claude -p` as its fallback.
 
+## Huddle Detection
+
+Meet, Zoom, Teams, Webex and Whereby are found from browser tabs or a running
+process. **Slack huddles** show neither: they run inside the Slack desktop app,
+and Slack is running all day whether or not you are in a call — so "is Slack in
+`ps`" would mean recording continuously.
+
+Instead, huddles are detected by asking **which process currently holds a
+microphone input stream**, via the CoreAudio process-object API (macOS 14.4+).
+That signal is true only during a call, and it gives both edges: when the huddle
+ends Slack releases the mic and the normal end-of-meeting grace period stops the
+recording, exactly as for a closed Meet tab.
+
+Reading this only inspects audio bookkeeping — it opens no stream, so it needs
+**no microphone permission**.
+
+Inspect what the detector sees:
+
+```sh
+mrec mic-probe            # one shot
+mrec mic-probe --watch    # poll until interrupted
+```
+
+Two design points worth knowing:
+
+- **It is an allowlist** (Slack, Discord, FaceTime). Treating *any* mic use as a
+  meeting would start recording whenever you dictate a message or open Voice
+  Memos. For an always-on recorder, a missed huddle is a cheaper mistake than an
+  unexpected recording. Add apps to `MIC_HINTS` in `meeting_recorder.py`.
+- **Our own capture is excluded.** While recording, `ffmpeg`/`sck-recorder` hold
+  the mic themselves; counting them would make the recorder detect itself and
+  never stop. Excluded via `MIC_SELF_PROCESSES`.
+
+Disable it entirely:
+
+```sh
+export MEETING_RECORDER_MIC_DETECT=0
+```
+
+### Known limitation
+
+If Slack releases the input stream while you are **muted**, a long muted stretch
+looks like the huddle ended and the recording stops after the grace period. This
+has not been confirmed either way — use `mrec mic-probe --watch`, join a huddle
+and toggle mute to check. If it turns out Slack does release on mute, the fix is
+to hold the "in a meeting" state for a longer grace period on the mic signal
+specifically.
+
 ## Commands
 
 ```sh
 ~/code/meeting-recorder/mrec doctor
+~/code/meeting-recorder/mrec mic-probe
 ~/code/meeting-recorder/mrec engine
 ~/code/meeting-recorder/mrec watch
 ~/code/meeting-recorder/mrec record test-meeting
@@ -413,6 +462,9 @@ Environment variables:
 - `MEETING_RECORDER_CALENDAR_START_GRACE_MIN` / `MEETING_RECORDER_CALENDAR_END_GRACE_MIN`: minutes of slack before an event starts / after it ends that still count as "now". Defaults: `10` / `5`.
 - `MEETING_RECORDER_GOG_BIN`: path to the `gog` CLI used for the calendar lookup. Default: `gog`.
 - `MEETING_RECORDER_POLL_SECONDS`: meeting detection interval. Default: `10`.
+- `MEETING_RECORDER_MIC_DETECT`: set to `0` to disable Slack-huddle (mic-in-use) detection. Default: on.
+- `MEETING_RECORDER_MIC_CACHE_SECONDS`: cache window for the mic probe. Default: `3`.
+- `MEETING_RECORDER_MIC_BIN`: path to the compiled `mic-probe` helper.
 - `MEETING_RECORDER_END_GRACE_SECONDS`: time to wait after meeting disappears before stopping. Default: `45`.
 - `MEETING_RECORDER_CHECK_IN_SECONDS`: while recording, ask whether to keep going after this many seconds. Default: `1800` (30 minutes). Set to `0` to disable. Dismissing or ignoring this prompt now **keeps recording** — only clicking "Stop and transcribe" stops it, so an unanswered check-in can no longer cut a meeting short.
 
