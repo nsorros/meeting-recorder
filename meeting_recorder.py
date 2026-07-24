@@ -51,6 +51,12 @@ STOP_REQUEST_FILE = STATE_DIR / "stop-request"
 # Published so the menu bar can show a real state (recording / transcribing /
 # watching) instead of a static label. Written by the watcher, read by the plugin.
 WATCHER_STATUS_FILE = STATE_DIR / "watcher-status"
+# The SwiftBar menu plugin polls once a minute; we nudge it to re-run on each
+# state change (via its refreshplugin URL scheme) so the title updates the
+# instant recording/transcription starts or ends instead of trailing by a poll.
+# Best-effort — a missing SwiftBar or an unknown URL scheme just no-ops.
+MENUBAR_REFRESH = os.environ.get("MEETING_RECORDER_MENUBAR_REFRESH", "1") != "0"
+MENUBAR_PLUGIN_NAME = os.environ.get("MEETING_RECORDER_MENUBAR_PLUGIN", "meeting-recorder")
 # OpenRouter balance, cached so the once-a-minute menu bar isn't a once-a-minute
 # API call. See openrouter_credits().
 CREDITS_CACHE = STATE_DIR / "openrouter-credits.json"
@@ -499,6 +505,17 @@ def osascript(script: str, timeout: int = 20) -> str:
     return proc.stdout.strip()
 
 
+def swiftbar_refresh() -> None:
+    """Ask the SwiftBar menu plugin to re-run now, so its title reflects a state
+    change immediately rather than on its next once-a-minute poll. Best-effort."""
+    if not MENUBAR_REFRESH:
+        return
+    try:
+        run(["/usr/bin/open", "-g", f"swiftbar://refreshplugin?name={MENUBAR_PLUGIN_NAME}"])
+    except Exception:
+        pass
+
+
 def write_watcher_status(status: str, meeting: str = "") -> None:
     """Publish the watcher's live state for the menu bar (recording / transcribing / watching)."""
     try:
@@ -509,6 +526,7 @@ def write_watcher_status(status: str, meeting: str = "") -> None:
         )
     except Exception as exc:
         log(f"could not write watcher status: {exc}")
+    swiftbar_refresh()
 
 
 def clear_watcher_status() -> None:
@@ -518,6 +536,7 @@ def clear_watcher_status() -> None:
         pass
     except Exception as exc:
         log(f"could not clear watcher status: {exc}")
+    swiftbar_refresh()
 
 
 def notify(title: str, text: str) -> None:
@@ -563,6 +582,42 @@ def alert(title: str, text: str) -> None:
         )
     except Exception as exc:
         log(f"alert failed: {exc}")
+
+
+def transcript_ready_dialog(meeting_name: str, transcript: Path) -> None:
+    """Completion popup shown when a transcript is ready.
+
+    Offers to open the rendered transcript — the same action as the menu bar's
+    "Open transcript" item. "Dismiss" is the default (Return/Esc) and the dialog
+    auto-dismisses, so a headless daemon never hangs on it; only an explicit
+    "Open transcript" click launches the reader.
+    """
+    name = (meeting_name or "").strip()
+    message = (
+        f"Transcript ready for “{name}”." if name
+        else "Transcription finished — your notes are ready."
+    )
+    script = (
+        "display dialog "
+        + applescript_quote(message)
+        + ' buttons {"Open transcript", "Dismiss"} default button "Dismiss" '
+          'with title "Meeting Recorder"'
+        + _icon_clause()
+        + " giving up after 30"
+    )
+    try:
+        out = osascript(script, timeout=35)
+    except Exception as exc:
+        log(f"transcript-ready dialog failed: {exc}")
+        return
+    if "button returned:Open transcript" in out:
+        try:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "open-transcript", str(transcript)],
+                start_new_session=True,
+            )
+        except Exception as exc:
+            log(f"could not open transcript from dialog: {exc}")
 
 
 def applescript_quote(value: str) -> str:
@@ -1932,20 +1987,26 @@ def watch() -> None:
             active = False
 
         if audio and audio.exists() and audio.stat().st_size > 1024:
+            final: Path | None = None
+            error: Exception | None = None
             try:
                 write_watcher_status("transcribing", short_meeting_label(reason))
                 notify("Meeting Recorder", "Meeting ended. Transcribing now.")
                 final = transcribe_audio(audio)
-                alert(
-                    "Meeting transcript ready",
-                    f"Saved notes:\n{display_path(final)}\n\nAudio:\n{display_path(audio)}",
-                )
                 log(f"transcript saved: {final}")
             except Exception as exc:
                 log(f"transcription error: {exc}")
+                error = exc
+            # Return to the listening state (and refresh the menu) BEFORE any
+            # dialog, so the title never sits on "Transcribing…" while a popup
+            # waits to be dismissed.
+            write_watcher_status("watching")
+            if final is not None:
+                transcript_ready_dialog(recording_display_name(audio), final)
+            elif error is not None:
                 alert(
                     "Meeting transcription failed",
-                    f"{exc}\n\nThe audio may still be saved at:\n{display_path(audio)}\n\nLog:\n{display_path(LOG)}",
+                    f"{error}\n\nThe audio may still be saved at:\n{display_path(audio)}\n\nLog:\n{display_path(LOG)}",
                 )
         elif audio:
             log(f"skipping transcription; missing or tiny audio file: {audio}")
@@ -1997,6 +2058,7 @@ def record_daemon(label: str) -> int:
         encoding="utf-8",
     )
     notify("Meeting Recorder", f"Manual recording started: {label}")
+    swiftbar_refresh()
     try:
         while not stop_requested:
             if proc.poll() is not None:
@@ -2011,12 +2073,13 @@ def record_daemon(label: str) -> int:
     finally:
         stop_recording(proc)
         MANUAL_PID_FILE.unlink(missing_ok=True)
+        swiftbar_refresh()
 
     if audio.exists() and audio.stat().st_size > 1024:
         try:
             notify("Meeting Recorder", "Manual recording stopped. Transcribing now.")
             final = transcribe_audio(audio)
-            alert("Manual transcript ready", f"Saved notes:\n{display_path(final)}\n\nAudio:\n{display_path(audio)}")
+            transcript_ready_dialog(recording_display_name(audio), final)
             return 0
         except Exception as exc:
             log(f"manual transcription error: {exc}")
