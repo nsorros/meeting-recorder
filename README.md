@@ -389,6 +389,17 @@ The menu shows:
 - **which engine the next transcription will use**, plus the OpenRouter balance (`Transcribes with: gemini-2.5-flash · $7.33 left`), turning red when it has degraded to Whisper or the balance is nearly out
 - the **last recording** and **last transcript**, each with their age and a one-click action to play / open them
 
+The plugin polls once a minute, but the watcher also nudges it to re-run the
+instant the state changes (via SwiftBar's `refreshplugin` URL scheme), so the
+title flips between `Rec` / `Transcribing…` / `Listening` immediately rather than
+trailing the real state by up to a poll. Best-effort — disable with
+`MEETING_RECORDER_MENUBAR_REFRESH=0`.
+
+When a transcript is ready, a popup announces it (`Transcript ready for "<meeting
+name>".`) with an **Open transcript** button — the same action as the menu bar's
+"Open transcript" item — and a default **Dismiss**. It auto-dismisses after 30s,
+so a headless daemon never hangs on it.
+
 Menu actions:
 
 - start/stop the login watcher
@@ -462,6 +473,8 @@ Environment variables:
 - `MEETING_RECORDER_CALENDAR_START_GRACE_MIN` / `MEETING_RECORDER_CALENDAR_END_GRACE_MIN`: minutes of slack before an event starts / after it ends that still count as "now". Defaults: `10` / `5`.
 - `MEETING_RECORDER_GOG_BIN`: path to the `gog` CLI used for the calendar lookup. Default: `gog`.
 - `MEETING_RECORDER_POLL_SECONDS`: meeting detection interval. Default: `10`.
+- `MEETING_RECORDER_MENUBAR_REFRESH`: set to `0` to stop nudging the SwiftBar menu plugin to re-run on each state change (it then updates only on its once-a-minute poll). Default: on.
+- `MEETING_RECORDER_MENUBAR_PLUGIN`: name SwiftBar knows the plugin by, used for the refresh nudge. Default: `meeting-recorder`.
 - `MEETING_RECORDER_MIC_DETECT`: set to `0` to disable Slack-huddle (mic-in-use) detection. Default: on.
 - `MEETING_RECORDER_MIC_CACHE_SECONDS`: cache window for the mic probe. Default: `3`.
 - `MEETING_RECORDER_MIC_BIN`: path to the compiled `mic-probe` helper.
