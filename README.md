@@ -5,7 +5,7 @@ Local macOS meeting recorder:
 1. watches for Google Meet, Teams, Zoom, Webex, or Whereby in browsers/apps, plus Slack huddles (see [Huddle Detection](#huddle-detection))
 2. asks before recording
 3. records the configured macOS audio input with `ffmpeg` as `.wav`
-4. transcribes via **OpenRouter** (cloud; seconds per file) with automatic fallback to local `whisper`
+4. transcribes via **OpenRouter** (cloud; seconds per file) with automatic fallback to local `whisper` — in a separate process, so the watcher keeps listening (see [Background Transcription](#background-transcription))
 5. optionally cleans the raw transcript into notes via OpenRouter (falling back to `claude -p`)
 
 Neither pass uses `claude -p` as the speech recognizer. OpenRouter (or local Whisper) does the audio transcription; a second OpenRouter call does the cleanup/summary pass, with `claude -p` as its fallback.
@@ -85,6 +85,42 @@ Logs are written to:
 ```sh
 ~/Library/Logs/meeting-recorder.log
 ```
+
+## Background Transcription
+
+Recording and transcription are independent. When a meeting ends the watcher hands
+the audio to a **detached transcription process** and goes straight back to
+detecting meetings, so a call that starts while the last one is still transcribing
+is recorded normally.
+
+This used to be inline, and the cost was invisible: the watch loop simply did not
+poll for the whole transcription. On 2026-08-12 an exhausted OpenRouter balance
+dropped a 22-minute meeting onto local Whisper and the recorder was deaf for **76
+minutes** — anything starting in that window was never recorded, with nothing in
+the log to say so.
+
+Transcriptions are **queued, not parallel**: one runs at a time
+(`MEETING_RECORDER_TRANSCRIBE_CONCURRENCY`, default `1`), because two local
+Whisper runs on the same machine finish later than the same two in sequence.
+Recording is never queued behind anything. Jobs run niced
+(`MEETING_RECORDER_TRANSCRIBE_NICE`, default `10`) so a CPU-bound Whisper run
+yields to live capture. If you transcribe on OpenRouter — network-bound, not
+CPU-bound — raising concurrency drains a backlog faster.
+
+Both `mrec status` and the menu bar list in-flight jobs, so "still transcribing" is
+visible while a new meeting records:
+
+```sh
+$ mrec status
+com.nsorros.meeting-recorder: running
+transcribing: 2026-08-12_15-01_Addgene-catch-up (pid 4242)
+queued: 2026-08-12_16-30_Standup (pid 4310)
+```
+
+A job that fails (or a queue that times out after
+`MEETING_RECORDER_TRANSCRIBE_QUEUE_TIMEOUT`, default 6h) alerts and leaves the
+audio in place; transcribe it later with `mrec transcribe <audio>`. Set
+`MEETING_RECORDER_ASYNC_TRANSCRIBE=0` to go back to blocking transcription.
 
 ## Transcription Engine
 
@@ -383,8 +419,8 @@ It is installed as:
 The menu shows:
 
 - clock `Waiting`: watcher running, no meeting in progress
-- filled record circle `Rec <elapsed>`: a recording is running
-- `Transcribing…`: cleaning up the last meeting
+- filled record circle `Rec <elapsed>`: a recording is running — with a `⧗` suffix when a transcription is also running behind it
+- `Transcribing…`: transcribing a finished meeting, with a line per in-flight job (`⏳ Transcribing: <meeting>`, `⏸ Queued for transcription: <meeting>`)
 - waveform-slash `Off`: watcher stopped
 - **which engine the next transcription will use**, plus the OpenRouter balance (`Transcribes with: gemini-2.5-flash · $7.33 left`), turning red when it has degraded to Whisper or the balance is nearly out
 - the **last recording** and **last transcript**, each with their age and a one-click action to play / open them
@@ -459,6 +495,10 @@ Environment variables:
 - `MEETING_RECORDER_NO_SPEECH_THRESHOLD`: probability above which a segment is treated as silence and dropped. Default: `0.6`.
 - `MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD`: seconds — skip silent stretches longer than this when a hallucination is detected (needs word timestamps, which the tool enables automatically). Default: `2`. Set to empty to disable.
 - `MEETING_RECORDER_NO_LOGO`: set to `1` to post notifications via osascript (generic icon) instead of the native notifier app. See **Notification Logo**.
+- `MEETING_RECORDER_ASYNC_TRANSCRIBE`: set to `0` to transcribe inline in the watcher instead of a detached process — the old behaviour, which makes the recorder deaf until the transcript is done. See **Background Transcription**.
+- `MEETING_RECORDER_TRANSCRIBE_CONCURRENCY`: how many transcriptions may run at once. Default: `1` (queue the rest). `0` means no limit.
+- `MEETING_RECORDER_TRANSCRIBE_NICE`: niceness added to a detached transcription so it yields to live capture. Default: `10`. `0` disables.
+- `MEETING_RECORDER_TRANSCRIBE_QUEUE_TIMEOUT`: seconds a queued transcription waits before giving up (the audio is kept either way). Default: `21600` (6h).
 - `MEETING_RECORDER_DISABLE_CLAUDE`: set to `1` to skip the cleanup pass.
 - `MEETING_RECORDER_CLAUDE_MODEL`: optional Claude model alias (fallback path).
 - `MEETING_RECORDER_CLEANUP_ENGINE`: `openrouter` (default) or `claude`.
