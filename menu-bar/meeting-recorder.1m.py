@@ -20,6 +20,10 @@ RECORDINGS = HOME / "Meetings/Recordings"
 LOG = HOME / "Library/Logs/meeting-recorder.log"
 PID_FILE = HOME / ".local/state/meeting-recorder/manual-recording.pid"
 STATUS_FILE = HOME / ".local/state/meeting-recorder/watcher-status"
+# One file per in-flight transcription. Transcription runs detached from the
+# watcher, so recording and transcribing are independent states that can (and
+# routinely do) overlap — the menu has to be able to show both at once.
+JOBS_DIR = HOME / ".local/state/meeting-recorder/transcribe-jobs"
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -71,6 +75,36 @@ def watcher_status() -> dict[str, str]:
     except ValueError:
         pass
     return state
+
+
+def process_is_zombie(pid: int) -> bool:
+    try:
+        return run(["/bin/ps", "-o", "stat=", "-p", str(pid)]).stdout.strip().startswith("Z")
+    except Exception:
+        return False
+
+
+def transcribe_jobs() -> list[dict[str, str]]:
+    """In-flight transcriptions (oldest first), skipping any whose process is gone."""
+    if not JOBS_DIR.exists():
+        return []
+    jobs: list[dict[str, str]] = []
+    for path in sorted(JOBS_DIR.iterdir()):
+        try:
+            # A zombie (exited, not yet reaped) still answers kill(pid, 0) — without
+            # this the menu would show a finished job as "Transcribing…" forever.
+            if not pid_running(int(path.name)) or process_is_zombie(int(path.name)):
+                continue
+            state: dict[str, str] = {}
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    state[key] = value
+        except (ValueError, OSError):
+            continue
+        jobs.append(state)
+    jobs.sort(key=lambda job: int(job.get("since", "0") or 0))
+    return jobs
 
 
 def _age(mtime: float) -> str:
@@ -166,13 +200,18 @@ def main() -> None:
     watcher = watcher_running()
     status = watcher_status() if watcher else {}
     state = status.get("status", "")
+    jobs = transcribe_jobs()
+    recording = bool(manual) or state == "recording"
 
-    # Menu bar title signals the current state at a glance.
-    if manual or state == "recording":
+    # Menu bar title signals the current state at a glance. Recording outranks
+    # transcribing: the two overlap now, and the live capture is the one worth
+    # knowing about — the ⧗ suffix says a transcription is running behind it.
+    if recording:
         since = manual.get("started_at", "") if manual else status.get("since", "")
         mins = elapsed(since)
-        menu_title(f"Rec {mins}".strip(), "record.circle.fill", color="red")
-    elif state == "transcribing":
+        title = f"Rec {mins}".strip() + (" ⧗" if jobs else "")
+        menu_title(title, "record.circle.fill", color="red")
+    elif jobs:
         menu_title("Transcribing…", "ellipsis.circle")
     elif watcher:
         menu_title("Listening", "waveform")
@@ -180,13 +219,18 @@ def main() -> None:
         menu_title("Off", "waveform.slash")
 
     print("---")
-    if manual or state == "recording":
+    if recording:
         meeting = manual.get("label", "manual recording") if manual else status.get("meeting", "meeting")
         print(f"🔴 Recording: {meeting}")
-    elif state == "transcribing":
-        print("⏳ Transcribing last meeting…")
     elif watcher:
         print("🎧 Listening for a meeting")
+    for job in jobs:
+        name = job.get("meeting", "meeting")
+        age = elapsed(job.get("since", ""))
+        if job.get("state") == "queued":
+            print(f"⏸ Queued for transcription: {name}")
+        else:
+            print(f"⏳ Transcribing: {name}  ({age})".rstrip())
     print(f"Watcher: {'running' if watcher else 'stopped'}")
     print_engine_section()
 

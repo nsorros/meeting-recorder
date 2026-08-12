@@ -51,6 +51,12 @@ STOP_REQUEST_FILE = STATE_DIR / "stop-request"
 # Published so the menu bar can show a real state (recording / transcribing /
 # watching) instead of a static label. Written by the watcher, read by the plugin.
 WATCHER_STATUS_FILE = STATE_DIR / "watcher-status"
+# One file per in-flight transcription, named for the job's pid. Transcription
+# runs in its own detached process (see spawn_transcribe_job), so it cannot use
+# WATCHER_STATUS_FILE: the watcher owns that file and would race a job writing
+# "transcribing" over its own "recording". A file per pid means each process
+# writes only its own state, and a dead job is detectable (see transcribe_jobs).
+TRANSCRIBE_JOBS_DIR = STATE_DIR / "transcribe-jobs"
 # The SwiftBar menu plugin polls once a minute; we nudge it to re-run on each
 # state change (via its refreshplugin URL scheme) so the title updates the
 # instant recording/transcription starts or ends instead of trailing by a poll.
@@ -152,6 +158,24 @@ WHISPER_NO_SPEECH_THRESHOLD = os.environ.get("MEETING_RECORDER_NO_SPEECH_THRESHO
 WHISPER_HALLUCINATION_SILENCE_THRESHOLD = os.environ.get("MEETING_RECORDER_HALLUCINATION_SILENCE_THRESHOLD", "2").strip()
 CLAUDE_MODEL = os.environ.get("MEETING_RECORDER_CLAUDE_MODEL", "")
 DISABLE_CLAUDE = os.environ.get("MEETING_RECORDER_DISABLE_CLAUDE", "").lower() in {"1", "true", "yes"}
+# Transcription runs in its own detached process so the watcher keeps polling for
+# meetings while it works. It used to run inline in the watch loop, which made the
+# recorder deaf for the whole transcription — 76 minutes on 2026-08-12, when an
+# exhausted OpenRouter balance dropped a 22-minute meeting onto local Whisper. Any
+# meeting starting in that window was simply never seen. Set this to 0 to go back
+# to blocking transcription (useful if a Whisper run ever disturbs a live capture).
+ASYNC_TRANSCRIBE = os.environ.get("MEETING_RECORDER_ASYNC_TRANSCRIBE", "1") != "0"
+# Detached jobs are niced so a CPU-bound local Whisper run always yields to the
+# capture helper and the watcher's polling. 0 disables.
+TRANSCRIBE_NICE = int(os.environ.get("MEETING_RECORDER_TRANSCRIBE_NICE", "10"))
+# Jobs take a slot before transcribing so two never run at once: local Whisper is
+# CPU-bound and two concurrent runs finish later than the same two in sequence.
+# Recording is never queued behind this — only transcription is. Raise it if you
+# transcribe on OpenRouter (network-bound) and want overlapping meetings drained
+# in parallel; 0 means no limit.
+TRANSCRIBE_CONCURRENCY = int(os.environ.get("MEETING_RECORDER_TRANSCRIBE_CONCURRENCY", "1"))
+# A queued job gives up rather than waiting forever behind a wedged one.
+TRANSCRIBE_QUEUE_TIMEOUT = int(os.environ.get("MEETING_RECORDER_TRANSCRIBE_QUEUE_TIMEOUT", str(6 * 60 * 60)))
 
 
 def _persisted_config() -> dict:
@@ -400,6 +424,18 @@ def pid_is_running(pid: int) -> bool:
     return True
 
 
+def process_is_zombie(pid: int) -> bool:
+    """True for a process that has exited but has not been reaped yet.
+
+    `os.kill(pid, 0)` succeeds for a zombie, so a transcription job that was
+    killed outright still looks alive — enough to hold the queue shut and leave
+    the menu bar reading "Transcribing…" forever. The spawning daemon never
+    wait()s on these (it must not block), so the window is real.
+    """
+    proc = run(["/bin/ps", "-o", "stat=", "-p", str(pid)], timeout=5)
+    return proc.stdout.strip().startswith("Z")
+
+
 def read_manual_state() -> dict[str, str] | None:
     if not MANUAL_PID_FILE.exists():
         return None
@@ -537,6 +573,73 @@ def clear_watcher_status() -> None:
     except Exception as exc:
         log(f"could not clear watcher status: {exc}")
     swiftbar_refresh()
+
+
+_transcribe_job_state: dict[str, object] = {}
+
+
+def write_transcribe_job(audio: Path, state: str) -> None:
+    """Publish this process's transcription job (queued / transcribing).
+
+    `since` is stamped once and then held: the queue loop rewrites this file on
+    every poll, and a moving timestamp would both reset the elapsed time shown in
+    the menu bar and keep re-shuffling the oldest-first order the queue uses to
+    decide who goes next. Re-publishing an unchanged state is a no-op so waiting
+    in the queue doesn't nudge the menu bar every few seconds.
+    """
+    if _transcribe_job_state.get("state") == state:
+        return
+    since = _transcribe_job_state.setdefault("since", int(time.time()))
+    _transcribe_job_state["state"] = state
+    try:
+        TRANSCRIBE_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        (TRANSCRIBE_JOBS_DIR / str(os.getpid())).write_text(
+            f"pid={os.getpid()}\nstate={state}\naudio={audio}\n"
+            f"meeting={recording_display_name(audio)}\nsince={since}\n",
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        log(f"could not write transcribe job state: {exc}")
+    swiftbar_refresh()
+
+
+def clear_transcribe_job() -> None:
+    try:
+        (TRANSCRIBE_JOBS_DIR / str(os.getpid())).unlink(missing_ok=True)
+    except Exception as exc:
+        log(f"could not clear transcribe job state: {exc}")
+    # Reset the memo with the file. A detached job exits here so it would not
+    # notice, but the inline fallback runs inside the long-lived watcher: leaving
+    # "transcribing" behind would make the next transcription's first write look
+    # like a no-op and publish no job at all.
+    _transcribe_job_state.clear()
+    swiftbar_refresh()
+
+
+def transcribe_jobs() -> list[dict[str, str]]:
+    """Live transcription jobs, oldest first. Prunes entries whose process died —
+    a job killed mid-run (logout, crash, a `kill`) would otherwise sit in the menu
+    bar as a permanent "transcribing" and hold the queue slot shut forever."""
+    if not TRANSCRIBE_JOBS_DIR.exists():
+        return []
+    jobs: list[dict[str, str]] = []
+    for path in TRANSCRIBE_JOBS_DIR.iterdir():
+        try:
+            pid = int(path.name)
+        except ValueError:
+            continue
+        if not pid_is_running(pid) or process_is_zombie(pid):
+            path.unlink(missing_ok=True)
+            continue
+        state: dict[str, str] = {}
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                state[key] = value
+        state.setdefault("pid", str(pid))
+        jobs.append(state)
+    jobs.sort(key=lambda job: int(job.get("since", "0") or 0))
+    return jobs
 
 
 def notify(title: str, text: str) -> None:
@@ -1888,6 +1991,129 @@ def clean_with_claude(
     return True
 
 
+def spawn_transcribe_job(audio: Path) -> bool:
+    """Hand `audio` to a detached transcription process and return immediately.
+
+    The whole point of the split: the caller (watcher or manual daemon) is free to
+    go back to detecting meetings while this runs, so a call that starts during
+    transcription is still recorded. The child inherits our environment, which is
+    how it gets the OpenRouter settings launchd handed the daemon.
+    """
+    try:
+        log_file = LOG.open("a", encoding="utf-8")
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "transcribe-job", str(audio)],
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        log(f"could not start background transcription ({exc}); transcribing inline instead")
+        return False
+    log(f"transcription handed to a background job: {display_path(audio)}")
+    return True
+
+
+def _claim_transcribe_slot(audio: Path) -> bool:
+    """Block until this job may transcribe. False if it waited past the timeout.
+
+    We stay published as `queued` until we win, so the menu bar shows a stable
+    state while waiting. Each round: count who is already transcribing, then rank
+    the queued jobs oldest-first (pid breaks a same-second tie). Every waiting job
+    reads the same files and sorts them the same way, so they agree on who goes
+    next without needing a real lock — and a job whose process died is pruned by
+    transcribe_jobs(), so a crash can't wedge the queue shut.
+    """
+    if TRANSCRIBE_CONCURRENCY <= 0:
+        write_transcribe_job(audio, "transcribing")
+        return True
+    me = str(os.getpid())
+    deadline = time.time() + TRANSCRIBE_QUEUE_TIMEOUT
+    waiting = False
+    while True:
+        jobs = transcribe_jobs()
+        running = [job for job in jobs if job.get("state") == "transcribing" and job.get("pid") != me]
+        free = TRANSCRIBE_CONCURRENCY - len(running)
+        if free > 0:
+            queued = sorted(
+                (job for job in jobs if job.get("state") == "queued"),
+                key=lambda job: (int(job.get("since", "0") or 0), int(job.get("pid", "0") or 0)),
+            )
+            rank = next((i for i, job in enumerate(queued) if job.get("pid") == me), 0)
+            if rank < free:
+                if waiting:
+                    log(f"transcription slot free; starting {display_path(audio)}")
+                write_transcribe_job(audio, "transcribing")
+                return True
+        if not waiting:
+            ahead = ", ".join(job.get("meeting", "?") for job in running) or "an earlier job"
+            log(f"another transcription is running ({ahead}); queued {display_path(audio)}")
+            waiting = True
+        if time.time() >= deadline:
+            return False
+        time.sleep(min(POLL_SECONDS, 30))
+
+
+def run_transcribe_job(audio: Path, *, detached: bool = True) -> int:
+    """Queue, transcribe, then report. Entry point for the internal `transcribe-job`
+    command spawned by spawn_transcribe_job().
+
+    `detached=False` is the inline fallback running inside the watcher or the manual
+    daemon: it must not renice that long-lived process, and must not sit in the
+    queue — blocking a recorder behind someone else's transcription is exactly the
+    problem this split exists to remove.
+    """
+    if detached and TRANSCRIBE_NICE:
+        try:
+            os.nice(TRANSCRIBE_NICE)
+        except OSError as exc:
+            log(f"could not lower transcription priority: {exc}")
+    write_transcribe_job(audio, "transcribing" if not detached else "queued")
+    try:
+        if detached and not _claim_transcribe_slot(audio):
+            log(f"gave up waiting for a transcription slot: {display_path(audio)}")
+            alert(
+                "Meeting transcription skipped",
+                f"Another transcription held the queue for "
+                f"{TRANSCRIBE_QUEUE_TIMEOUT // 3600}h, so this one never started.\n\n"
+                f"The audio is safe at:\n{display_path(audio)}\n\n"
+                f"Transcribe it with:\nmrec transcribe {display_path(audio)}",
+            )
+            return 1
+        try:
+            final = transcribe_audio(audio)
+        except Exception as exc:
+            log(f"transcription error: {exc}")
+            alert(
+                "Meeting transcription failed",
+                f"{exc}\n\nThe audio may still be saved at:\n{display_path(audio)}\n\n"
+                f"Log:\n{display_path(LOG)}",
+            )
+            return 1
+        log(f"transcript saved: {final}")
+        transcript_ready_dialog(recording_display_name(audio), final)
+        return 0
+    finally:
+        clear_transcribe_job()
+
+
+def transcribe_recording(audio: Path, *, label: str) -> None:
+    """Transcribe a finished recording, in the background when we can.
+
+    Falls back to transcribing inline (blocking the caller, the old behaviour) when
+    async is switched off or the job could not be spawned — never silently skipping
+    a recording, which is the one outcome worse than a slow one.
+    """
+    if not audio.exists() or audio.stat().st_size <= 1024:
+        log(f"skipping transcription; missing or tiny audio file: {audio}")
+        return
+    if ASYNC_TRANSCRIBE and spawn_transcribe_job(audio):
+        notify("Meeting Recorder", f"{label} Transcribing in the background.")
+        return
+    notify("Meeting Recorder", f"{label} Transcribing now.")
+    run_transcribe_job(audio, detached=False)
+
+
 def watch() -> None:
     log_section(
         "watcher started",
@@ -1986,32 +2212,15 @@ def watch() -> None:
                 stop_recording(proc)
             active = False
 
-        if audio and audio.exists() and audio.stat().st_size > 1024:
-            final: Path | None = None
-            error: Exception | None = None
-            try:
-                write_watcher_status("transcribing", short_meeting_label(reason))
-                notify("Meeting Recorder", "Meeting ended. Transcribing now.")
-                final = transcribe_audio(audio)
-                log(f"transcript saved: {final}")
-            except Exception as exc:
-                log(f"transcription error: {exc}")
-                error = exc
-            # Return to the listening state (and refresh the menu) BEFORE any
-            # dialog, so the title never sits on "Transcribing…" while a popup
-            # waits to be dismissed.
-            write_watcher_status("watching")
-            if final is not None:
-                transcript_ready_dialog(recording_display_name(audio), final)
-            elif error is not None:
-                alert(
-                    "Meeting transcription failed",
-                    f"{error}\n\nThe audio may still be saved at:\n{display_path(audio)}\n\nLog:\n{display_path(LOG)}",
-                )
-        elif audio:
-            log(f"skipping transcription; missing or tiny audio file: {audio}")
-
+        # Transcription is handed to its own process and we go straight back to
+        # polling. It used to run right here, and the loop was blind for as long as
+        # it took — an hour or more once a dead OpenRouter balance fell back to
+        # local Whisper — so a meeting that started in that window was never seen.
+        # The job reports its own result (transcript popup, or an alert on failure).
         write_watcher_status("watching")
+        if audio:
+            transcribe_recording(audio, label="Meeting ended.")
+
         if active:
             time.sleep(POLL_SECONDS)
 
@@ -2076,15 +2285,11 @@ def record_daemon(label: str) -> int:
         swiftbar_refresh()
 
     if audio.exists() and audio.stat().st_size > 1024:
-        try:
-            notify("Meeting Recorder", "Manual recording stopped. Transcribing now.")
-            final = transcribe_audio(audio)
-            transcript_ready_dialog(recording_display_name(audio), final)
-            return 0
-        except Exception as exc:
-            log(f"manual transcription error: {exc}")
-            alert("Manual transcription failed", f"{exc}\n\nAudio:\n{display_path(audio)}\n\nLog:\n{display_path(LOG)}")
-            return 1
+        # Same split as the watcher: hand the audio to a background job so this
+        # daemon exits now. It shares the transcription queue with the watcher's
+        # jobs, so a manual recording and an auto one never transcribe at once.
+        transcribe_recording(audio, label="Manual recording stopped.")
+        return 0
     log(f"manual recording missing or tiny: {audio}")
     return 1
 
@@ -2992,6 +3197,14 @@ def install_launch_agent() -> Path:
         env_vars["MEETING_RECORDER_OPENROUTER_ENV_FILE"] = str(Path(OPENROUTER_ENV_FILE).expanduser())
     if OPENROUTER_MODEL:
         env_vars["MEETING_RECORDER_OPENROUTER_MODEL"] = OPENROUTER_MODEL
+    # Only the non-defaults, for the same reason: a regenerated plist that drops
+    # them would silently put transcription back on the defaults.
+    if not ASYNC_TRANSCRIBE:
+        env_vars["MEETING_RECORDER_ASYNC_TRANSCRIBE"] = "0"
+    if TRANSCRIBE_CONCURRENCY != 1:
+        env_vars["MEETING_RECORDER_TRANSCRIBE_CONCURRENCY"] = str(TRANSCRIBE_CONCURRENCY)
+    if TRANSCRIBE_NICE != 10:
+        env_vars["MEETING_RECORDER_TRANSCRIBE_NICE"] = str(TRANSCRIBE_NICE)
     # Same settings on disk for everyone who does not inherit the plist (the menu
     # bar, a plain shell). Written from the same values in the same place so the
     # two cannot drift.
@@ -3085,6 +3298,11 @@ def status_launch_agent() -> int:
         stripped = line.strip()
         if stripped.startswith(("state =", "pid =", "last exit code =")):
             print(stripped)
+    # Transcriptions are their own processes now, so the watcher being idle says
+    # nothing about whether one is still working. List them explicitly.
+    for job in transcribe_jobs():
+        verb = "queued" if job.get("state") == "queued" else "transcribing"
+        print(f"{verb}: {job.get('meeting', '?')} (pid {job.get('pid', '?')})")
     print(f"Log: {display_path(LOG)}")
     return 0
 
@@ -3125,6 +3343,8 @@ def main() -> int:
     sub.add_parser("stop-recording", help="stop the current recording (manual OR watcher) and transcribe it")
     daemon = sub.add_parser("record-daemon", help=argparse.SUPPRESS)
     daemon.add_argument("label", nargs="?", default="manual-meeting")
+    tr_job = sub.add_parser("transcribe-job", help=argparse.SUPPRESS)
+    tr_job.add_argument("audio")
     sub.add_parser("serve-transcripts", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -3151,6 +3371,8 @@ def main() -> int:
     if args.command == "transcribe":
         print(transcribe_audio(Path(args.audio).expanduser()))
         return 0
+    if args.command == "transcribe-job":
+        return run_transcribe_job(Path(args.audio).expanduser())
     if args.command == "install-launch-agent":
         print(install_launch_agent())
         return 0
