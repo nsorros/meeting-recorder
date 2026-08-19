@@ -806,46 +806,54 @@ def active_processes() -> list[str]:
     return [Path(line.strip()).name for line in proc.stdout.splitlines() if line.strip()]
 
 
+# One tab per row, url and title inside a row. Both separators have to be
+# strings no page can put in a URL or a title, and — the part that bit us — the
+# row separator has to be written into the string *by us*: `list as text` joins
+# with AppleScript's text item delimiters, which default to "", so every tab
+# came back glued into one line and the first tab's title swallowed the rest.
+TAB_ROW_SEP = "\x1e"   # ASCII record separator
+TAB_FIELD_SEP = " ||| "
+
+
+def tab_script(app: str, kind: str) -> str:
+    """AppleScript listing every tab of `app` as url + TAB_FIELD_SEP + title rows."""
+    # Chrome-family browsers call it `title`, Safari calls it `name`.
+    title_prop = "title" if kind == "chrome" else "name"
+    return f'''
+        if application {applescript_quote(app)} is running then
+          tell application {applescript_quote(app)}
+            set rows to ""
+            repeat with w in windows
+              repeat with t in tabs of w
+                set rows to rows & (URL of t as text) & {applescript_quote(TAB_FIELD_SEP)} & ({title_prop} of t as text) & (character id 30)
+              end repeat
+            end repeat
+            return rows
+          end tell
+        end if
+    '''
+
+
+def parse_tab_rows(app: str, out: str) -> list[tuple[str, str, str]]:
+    """Parse tab_script output into (app, url, title) triples."""
+    parsed: list[tuple[str, str, str]] = []
+    for row in out.split(TAB_ROW_SEP):
+        if TAB_FIELD_SEP not in row:
+            continue
+        url, title = row.split(TAB_FIELD_SEP, 1)
+        parsed.append((app, url.strip(), title.strip()))
+    return parsed
+
+
 def browser_tabs() -> list[tuple[str, str, str]]:
     found: list[tuple[str, str, str]] = []
     for app, kind in BROWSER_APPS.items():
-        if kind == "chrome":
-            script = f'''
-                if application {applescript_quote(app)} is running then
-                  tell application {applescript_quote(app)}
-                    set rows to {{}}
-                    repeat with w in windows
-                      repeat with t in tabs of w
-                        set end of rows to (URL of t as text) & " ||| " & (title of t as text)
-                      end repeat
-                    end repeat
-                    return rows as text
-                  end tell
-                end if
-            '''
-        else:
-            script = f'''
-                if application {applescript_quote(app)} is running then
-                  tell application {applescript_quote(app)}
-                    set rows to {{}}
-                    repeat with w in windows
-                      repeat with t in tabs of w
-                        set end of rows to (URL of t as text) & " ||| " & (name of t as text)
-                      end repeat
-                    end repeat
-                    return rows as text
-                  end tell
-                end if
-            '''
         try:
-            out = osascript(script, timeout=8)
+            out = osascript(tab_script(app, kind), timeout=8)
         except Exception as exc:
             log(f"could not inspect {app}: {exc}")
             continue
-        for row in re.split(r",\s*", out):
-            if " ||| " in row:
-                url, title = row.split(" ||| ", 1)
-                found.append((app, url.strip(), title.strip()))
+        found.extend(parse_tab_rows(app, out))
     return found
 
 
@@ -909,12 +917,15 @@ def mic_input_holders(*, use_cache: bool = True) -> list[tuple[int, str]]:
 
 
 def detect_meeting() -> str | None:
-    for app, url, title in browser_tabs():
-        haystack = f"{url} {title}".lower()
-        if any(hint.lower() in haystack for hint in MEETING_HINTS):
-            return f"{app}: {title or url}"
-        if any(hint.lower() in haystack for hint in TITLE_HINTS):
-            return f"{app}: {title or url}"
+    tabs = browser_tabs()
+    # Two passes, not one: MEETING_HINTS match the call's own URL, so a real
+    # Meet/Teams/Zoom tab must name the recording even when some tab opened
+    # earlier merely mentions "Google Meet" in its title.
+    for hints in (MEETING_HINTS, TITLE_HINTS):
+        for app, url, title in tabs:
+            haystack = f"{url} {title}".lower()
+            if any(hint.lower() in haystack for hint in hints):
+                return f"{app}: {title or url}"
 
     processes = active_processes()
     for process in processes:
