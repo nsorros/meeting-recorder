@@ -336,6 +336,17 @@ BROWSER_APPS = {
     "Safari": "safari",
 }
 
+# Browsers with no AppleScript dictionary at all — DuckDuckGo ships none, so
+# `tell application "DuckDuckGo" to get URL of front document` fails with -1728
+# and there is no `tabs` class to ask for. Their tabs are only readable through
+# the accessibility tree (System Events), which needs the Accessibility grant.
+#
+# The window *title* is not enough on its own: it names only the frontmost tab,
+# so a call in a background tab would be invisible and switching tabs mid-call
+# would make detection flap on and off. The tab strip's AXTabGroup lists every
+# tab, focused or not.
+AX_TAB_APPS = ("DuckDuckGo",)
+
 MEETING_HINTS = (
     "meet.google.com",
     "teams.microsoft.com",
@@ -845,6 +856,77 @@ def parse_tab_rows(app: str, out: str) -> list[tuple[str, str, str]]:
     return parsed
 
 
+# The tab strip sits three UI levels down (window > group > scroll area >
+# AXTabGroup) and its children are one radio button per tab. Walking `entire
+# contents of window 1` finds them too, but that descends into the rendered web
+# page as well and took ~4.5s per poll; the fixed three-level walk takes ~0.8s.
+# Anything that is not a tab (the "Open a new tab" button) has a different
+# accessibility description and is dropped.
+def ax_tab_script(app: str) -> str:
+    """AppleScript listing every tab title of `app` from the accessibility tree."""
+    return f'''
+        tell application "System Events"
+          if exists (process {applescript_quote(app)}) then
+            tell process {applescript_quote(app)}
+              set tabRows to ""
+              repeat with w in windows
+                repeat with a in (UI elements of w)
+                  repeat with b in (UI elements of a)
+                    repeat with c in (UI elements of b)
+                      try
+                        if (role of c as text) is "AXTabGroup" then
+                          repeat with t in (UI elements of c)
+                            try
+                              if (description of t as text) is "Tab" then
+                                set tabRows to tabRows & (name of t as text) & (character id 30)
+                              end if
+                            end try
+                          end repeat
+                        end if
+                      end try
+                    end repeat
+                  end repeat
+                end repeat
+              end repeat
+              return tabRows
+            end tell
+          end if
+        end tell
+    '''
+
+
+def parse_ax_tab_rows(app: str, out: str) -> list[tuple[str, str, str]]:
+    """Parse ax_tab_script output into (app, url, title) triples.
+
+    The accessibility tree exposes no URL, so these carry an empty one: they can
+    only ever match on the title, which is why TITLE_HINTS has to cover every
+    platform this path is expected to catch.
+    """
+    return [(app, "", title.strip()) for title in out.split(TAB_ROW_SEP) if title.strip()]
+
+
+# Accessibility is granted per launching process, so the daemon can be denied
+# while a shell is allowed. Log that once rather than every poll.
+_AX_DENIED_LOGGED: set[str] = set()
+
+
+def ax_browser_tabs(app: str) -> list[tuple[str, str, str]]:
+    try:
+        out = osascript(ax_tab_script(app), timeout=8)
+    except Exception as exc:
+        message = str(exc)
+        denied = "-1719" in message or "not allowed" in message.lower() or "assistive" in message.lower()
+        if not denied:
+            log(f"could not inspect {app}: {exc}")
+        elif app not in _AX_DENIED_LOGGED:
+            _AX_DENIED_LOGGED.add(app)
+            log(f"cannot read {app} tabs: grant Accessibility to this process "
+                f"(System Settings > Privacy & Security > Accessibility); meetings in {app} "
+                f"will not be detected until then")
+        return []
+    return parse_ax_tab_rows(app, out)
+
+
 def browser_tabs() -> list[tuple[str, str, str]]:
     found: list[tuple[str, str, str]] = []
     for app, kind in BROWSER_APPS.items():
@@ -854,6 +936,8 @@ def browser_tabs() -> list[tuple[str, str, str]]:
             log(f"could not inspect {app}: {exc}")
             continue
         found.extend(parse_tab_rows(app, out))
+    for app in AX_TAB_APPS:
+        found.extend(ax_browser_tabs(app))
     return found
 
 
@@ -916,6 +1000,15 @@ def mic_input_holders(*, use_cache: bool = True) -> list[tuple[int, str]]:
     return holders
 
 
+# Every browser writes Meet's tab title with an EN DASH ("Meet – Standup"),
+# while the hint list spells it with a hyphen, so "Meet - " never once matched a
+# real title. It went unnoticed while Safari and Chrome could be matched on
+# meet.google.com instead; the accessibility path has no URL to fall back on.
+def match_text(text: str) -> str:
+    """Lowercase and flatten dash variants, so hints match real titles."""
+    return text.replace("\u2013", "-").replace("\u2014", "-").lower()
+
+
 def detect_meeting() -> str | None:
     tabs = browser_tabs()
     # Two passes, not one: MEETING_HINTS match the call's own URL, so a real
@@ -923,8 +1016,8 @@ def detect_meeting() -> str | None:
     # earlier merely mentions "Google Meet" in its title.
     for hints in (MEETING_HINTS, TITLE_HINTS):
         for app, url, title in tabs:
-            haystack = f"{url} {title}".lower()
-            if any(hint.lower() in haystack for hint in hints):
+            haystack = match_text(f"{url} {title}")
+            if any(match_text(hint) in haystack for hint in hints):
                 return f"{app}: {title or url}"
 
     processes = active_processes()
