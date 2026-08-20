@@ -1176,14 +1176,28 @@ def _parse_event_dt(node: dict, key: str) -> dt.datetime | None:
     return None  # all-day events carry no meeting name we want
 
 
-def _fetch_calendar_events() -> list[dict]:
+def _fetch_calendar_events(day: dt.date | None = None) -> list[dict]:
+    """Every event on `day` (default today) across the configured accounts.
+
+    The account an event came from is carried back as `_account`. Google does not
+    put it in the payload and it is the only thing that says *whose* calendar a
+    meeting was on, which is the difference between a Finant call and a Mantis one
+    when the same invite sits in both.
+    """
     events: list[dict] = []
     for pair in CALENDAR_ACCOUNTS.split(","):
         pair = pair.strip()
         if not pair:
             continue
         client, _, account = pair.partition("=")
-        cmd = [GOG_BIN, "calendar", "events", "--today", "--json", "--max", "30"]
+        cmd = [GOG_BIN, "calendar", "events", "--json", "--max", "30"]
+        if day is None:
+            cmd.append("--today")
+        else:
+            # A named day, not --today: everything we look up after the fact
+            # happened on some other day, and --today is relative to when gog runs.
+            cmd += ["--from", day.isoformat(),
+                    "--to", (day + dt.timedelta(days=1)).isoformat()]
         if client.strip():
             cmd += ["--client", client.strip()]
         if account.strip():
@@ -1200,27 +1214,129 @@ def _fetch_calendar_events() -> list[dict]:
             data = json.loads(proc.stdout or "{}")
         except json.JSONDecodeError:
             continue
-        events.extend(data.get("events", []) or [])
+        for ev in data.get("events", []) or []:
+            if isinstance(ev, dict):
+                ev.setdefault("_account", account.strip() or client.strip() or "")
+                events.append(ev)
     return events
 
 
-def calendar_meeting_title() -> str | None:
-    """Best-effort title of the calendar event happening right now.
+def humanise_email(email: str) -> str:
+    """A plausible display name for an address that carries no display name.
 
-    Prefers a Google Meet event whose room code matches an open tab, then any
-    video event, then the most-recently-started event overlapping now. Returns
-    None on any miss (no gog, no network, nothing scheduled) so naming falls
-    back to the tab title.
+    `persefoni@finant.ai` -> `Persefoni`, `fernando.ortiz@x.com` -> `Fernando Ortiz`.
+    It is a guess and is labelled as one wherever it is used: a shared mailbox or an
+    initials address will produce nonsense, and the cleanup prompt is told so rather
+    than being handed it as a fact.
+    """
+    local = (email or "").split("@", 1)[0]
+    local = re.sub(r"[._+\-]+", " ", local)
+    local = re.sub(r"\d+", " ", local).strip()
+    if not local:
+        return email or ""
+    # Only capitalise what is already lowercase, so "McDonald" survives being read.
+    return " ".join(w if w[:1].isupper() else w.capitalize() for w in local.split())
+
+
+def _display_name(raw: str) -> str:
+    """The name out of a Google display name, which is not always just a name.
+
+    Some invitations carry `Persefoni Noulika <persefoni.noulika@gmail.com>` in the
+    field, and handing that whole string to the cleanup as a person's name puts an
+    email address in the middle of a spoken line.
+    """
+    name = (raw or "").strip()
+    name = re.sub(r"\s*<[^>]*>\s*", " ", name).strip()
+    return name.strip(" ,;\"'")
+
+
+def _attendee(att: dict) -> dict:
+    email = (att.get("email") or "").strip()
+    name = _display_name(att.get("displayName") or "")
+    return {
+        "name": name or humanise_email(email),
+        "email": email,
+        # Whether the name is Google's or ours. The prompt must not treat a name we
+        # derived from an address as evidence that anyone is called that.
+        "guessed_name": not name,
+        "self": bool(att.get("self")),
+        "organizer": bool(att.get("organizer")),
+        "response": (att.get("responseStatus") or "").strip(),
+    }
+
+
+# Enough of an agenda to help identify who is who; not so much that a pasted thread
+# doubles the cleanup prompt.
+EVENT_DESCRIPTION_MAX = int(os.environ.get("MEETING_RECORDER_EVENT_DESCRIPTION_MAX", "600"))
+
+
+def trim_event(ev: dict) -> dict:
+    """The parts of a Google event worth keeping beside a recording, forever.
+
+    A calendar entry is edited and eventually deleted; a recording is not. So what
+    the invite said at the moment of recording is written down rather than looked up
+    again later, and this is the shape that gets written.
+    """
+    attendees = [
+        _attendee(att)
+        for att in (ev.get("attendees") or [])
+        if isinstance(att, dict) and not att.get("resource")
+    ]
+    org = ev.get("organizer") or {}
+    start = ev.get("start") or {}
+    end = ev.get("end") or {}
+    return {
+        "summary": (ev.get("summary") or "").strip(),
+        "start": start.get("dateTime") or start.get("date") or "",
+        "end": end.get("dateTime") or end.get("date") or "",
+        "hangout_link": ev.get("hangoutLink") or "",
+        "html_link": ev.get("htmlLink") or "",
+        "location": (ev.get("location") or "").strip(),
+        "description": (ev.get("description") or "").strip()[:EVENT_DESCRIPTION_MAX],
+        "organizer": {
+            "name": _display_name(org.get("displayName") or "") or humanise_email(org.get("email") or ""),
+            "email": (org.get("email") or "").strip(),
+        },
+        "attendees": attendees,
+        "account": ev.get("_account") or "",
+        "event_id": ev.get("id") or "",
+    }
+
+
+def _slug_matches(a: str, b: str) -> bool:
+    """Whether two slugs name the same meeting, allowing for `slug()`'s truncation."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long = sorted((a, b), key=len)
+    return len(short) >= 6 and long.startswith(short)
+
+
+def best_event_at(
+    when: dt.datetime,
+    *,
+    day: dt.date | None = None,
+    open_codes: tuple[str, ...] | set[str] = (),
+    want_slug: str = "",
+) -> dict | None:
+    """The calendar event that best explains a recording made at `when`.
+
+    Scored highest first: a Meet room code that is open in a browser tab (proof,
+    but only available while the meeting is happening), then a slug matching the
+    recording's own name (the only evidence left after the fact), then any event
+    with a video link, then any event at all. Ties go to the later start, so a
+    meeting that began inside another one wins.
+
+    Returns the raw event so callers can decide what to keep. None on any miss —
+    no gog, no network, nothing scheduled — so naming falls back to the tab title.
     """
     if not CALENDAR_LOOKUP or not command_exists(GOG_BIN):
         return None
-    now = dt.datetime.now().astimezone()
     start_grace = dt.timedelta(minutes=CALENDAR_START_GRACE_MIN)
     end_grace = dt.timedelta(minutes=CALENDAR_END_GRACE_MIN)
-    open_codes = _meet_codes_open()
-
-    best: tuple[int, dt.datetime, str] | None = None  # (score, start, summary)
-    for ev in _fetch_calendar_events():
+    best: tuple[int, dt.datetime, dict] | None = None
+    for ev in _fetch_calendar_events(day):
         summary = (ev.get("summary") or "").strip()
         if not summary:
             continue
@@ -1228,30 +1344,144 @@ def calendar_meeting_title() -> str | None:
         end = _parse_event_dt(ev, "end")
         if not start or not end:
             continue
-        if not (start - start_grace <= now <= end + end_grace):
+        if not (start - start_grace <= when <= end + end_grace):
             continue
-        hangout = ev.get("hangoutLink") or ""
-        code_match = any(code in hangout.lower() for code in open_codes)
-        score = 2 if code_match else (1 if hangout else 0)
-        candidate = (score, start, summary)
+        hangout = (ev.get("hangoutLink") or "").lower()
+        if any(code in hangout for code in open_codes):
+            score = 3
+        elif _slug_matches(slug(summary), want_slug):
+            score = 2
+        elif hangout:
+            score = 1
+        else:
+            score = 0
         if best is None or (score, start) > (best[0], best[1]):
-            best = candidate
-    if best:
-        log(f"calendar match for recording name: {best[2]!r}")
-        return best[2]
+            best = (score, start, ev)
+    return best[2] if best else None
+
+
+def calendar_meeting_event() -> dict | None:
+    """The trimmed calendar event happening right now, or None on any miss."""
+    if not CALENDAR_LOOKUP or not command_exists(GOG_BIN):
+        return None
+    ev = best_event_at(dt.datetime.now().astimezone(), open_codes=_meet_codes_open())
+    if ev is None:
+        return None
+    trimmed = trim_event(ev)
+    log(f"calendar match for recording name: {trimmed['summary']!r} "
+        f"({len(trimmed['attendees'])} on the invite)")
+    return trimmed
+
+
+def calendar_meeting_title() -> str | None:
+    """Best-effort title of the calendar event happening right now."""
+    event = calendar_meeting_event()
+    return (event or {}).get("summary") or None
+
+
+# Beside the wav, like the .sck.log: the output folder does not exist yet when a
+# recording starts, and this has to be written *then*, while the calendar still
+# agrees about what "now" is.
+EVENT_SUFFIX = ".event.json"
+# Every extension a recording has ever been written with; the wav is what we produce
+# now, the rest are the archive's.
+AUDIO_SUFFIXES = (".wav", ".m4a", ".mp3", ".aac", ".flac")
+RECORDING_STEM_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})(?:_(.*))?$")
+
+
+def event_sidecar_for(audio: Path) -> Path:
+    return audio.with_name(audio.stem + EVENT_SUFFIX)
+
+
+def write_event_sidecar(audio: Path, event: dict | None) -> None:
+    """Cache the invite beside the recording. Never fatal: this is context, not audio."""
+    if not event:
+        return
+    try:
+        event_sidecar_for(audio).write_text(
+            json.dumps(event, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        log(f"could not write calendar sidecar for {display_path(audio)}: {exc}")
+
+
+def read_event_sidecar(audio: Path) -> dict | None:
+    path = event_sidecar_for(audio)
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) and data else None
+    except Exception as exc:
+        log(f"unreadable calendar sidecar {display_path(path)}: {exc}")
     return None
+
+
+def parse_recording_stem(stem: str) -> tuple[dt.datetime, str] | None:
+    """Split `2026-08-20_10-18-00_Standup` into when it was recorded and its slug."""
+    match = RECORDING_STEM_RE.match(stem)
+    if not match:
+        return None
+    try:
+        when = dt.datetime.strptime(
+            f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H-%M-%S").astimezone()
+    except ValueError:
+        return None
+    return when, (match.group(3) or "")
+
+
+def event_for_recording(audio: Path, *, lookup: bool = True) -> dict | None:
+    """The calendar event behind a recording: cached sidecar first, calendar second.
+
+    The sidecar is written the moment a recording starts, so it is the answer for
+    anything recorded since. For the archive — and for a recording the watcher could
+    not match at the time — the timestamp in the filename is enough to go and ask,
+    and a hit is written back so the trip is made once.
+
+    A miss is deliberately *not* cached. "Nothing was scheduled" and "the network was
+    down" arrive here as the same None, and writing the second one down would make a
+    passing failure permanent. Pass `lookup=False` where the wait would be felt (a
+    page listing the whole archive) and only the sidecar is consulted.
+    """
+    cached = read_event_sidecar(audio)
+    if cached is not None:
+        return cached
+    if not lookup:
+        return None
+    parsed = parse_recording_stem(audio.stem)
+    if parsed is None:
+        return None
+    when, name_slug = parsed
+    try:
+        ev = best_event_at(when, day=when.date(), want_slug=name_slug)
+    except Exception as exc:
+        log(f"calendar lookup for {display_path(audio)} failed: {exc}")
+        return None
+    if ev is None:
+        return None
+    trimmed = trim_event(ev)
+    write_event_sidecar(audio, trimmed)
+    return trimmed
+
+
+def meeting_context(reason: str) -> tuple[str, dict | None]:
+    """The best human name for a recording of `reason`, and the invite behind it.
+
+    Both halves come out of one calendar lookup on purpose. The name was always the
+    point; the roster is what makes the notes able to say who spoke, and asking twice
+    would be two chances to get a different answer.
+    """
+    try:
+        event = calendar_meeting_event()
+    except Exception as exc:
+        log(f"calendar naming errored, falling back to tab title: {exc}")
+        event = None
+    if event and event.get("summary"):
+        return event["summary"], event
+    return (clean_tab_title(reason) or short_meeting_label(reason)), event
 
 
 def meeting_name(reason: str) -> str:
     """The best human name for a recording of the meeting `reason` describes."""
-    try:
-        cal = calendar_meeting_title()
-    except Exception as exc:
-        log(f"calendar naming errored, falling back to tab title: {exc}")
-        cal = None
-    if cal:
-        return cal
-    return clean_tab_title(reason) or short_meeting_label(reason)
+    return meeting_context(reason)[0]
 
 
 def ensure_recorder_built() -> Path:
@@ -1326,7 +1556,12 @@ def _start_screencapturekit(reason: str, path: Path) -> subprocess.Popen[bytes] 
 def start_recording(reason: str) -> tuple[subprocess.Popen[bytes], Path]:
     ROOT.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = ROOT / f"{now}_{slug(meeting_name(reason))}.wav"
+    name, event = meeting_context(reason)
+    path = ROOT / f"{now}_{slug(name)}.wav"
+    # Written before a single frame is captured, because the calendar is only asked
+    # what is happening *now* — an hour later this meeting is over and the answer has
+    # moved on. The roster it holds is what lets the cleanup name the voices.
+    write_event_sidecar(path, event)
 
     proc: subprocess.Popen[bytes] | None = None
     if CAPTURE_BACKEND in ("auto", "screencapturekit", "sck"):
@@ -1525,11 +1760,17 @@ def transcribe_audio(audio: Path) -> Path:
     diarized_txt = diarize_with_whisperx(audio, out_dir) if DIARIZE else None
 
     final_md = out_dir / f"{audio.stem}.meeting.md"
+    # Who was invited, so the cleanup has names to put to the voices. Normally this is
+    # the sidecar written when recording started; the lookup is the second chance for a
+    # meeting the watcher could not match at the time.
+    event = event_for_recording(audio)
+    if event:
+        log(f"cleanup roster: {len(attendee_lines(event))} from {event.get('summary') or 'the invite'}")
     if DISABLE_CLAUDE:
         log("claude cleanup disabled; writing basic markdown transcript")
         write_basic_meeting_md(diarized_txt or raw_txt, final_md, audio)
     else:
-        clean_with_claude(raw_txt, final_md, audio, diarized_txt=diarized_txt)
+        clean_with_claude(raw_txt, final_md, audio, diarized_txt=diarized_txt, event=event)
     log_section("transcription finished", final_notes=display_path(final_md), raw_transcript=display_path(raw_txt))
     return final_md
 
@@ -1910,7 +2151,85 @@ def write_basic_meeting_md(raw_txt: Path, final_md: Path, audio: Path) -> None:
     )
 
 
-def build_cleanup_prompt(raw_txt: Path, audio: Path, diarized_txt: Path | None = None) -> str:
+def attendee_lines(event: dict | None) -> list[str]:
+    """One line per person the invite expected, ready to drop into a prompt.
+
+    Declined invitations are left out: someone who said no is a name the model would
+    otherwise be free to hang a voice on. Everyone else is kept, including the people
+    who never answered, because a "needsAction" that turned up is the normal case.
+    """
+    lines: list[str] = []
+    for att in (event or {}).get("attendees") or []:
+        if not isinstance(att, dict):
+            continue
+        if (att.get("response") or "").lower() == "declined":
+            continue
+        name = (att.get("name") or "").strip()
+        email = (att.get("email") or "").strip()
+        if not name and not email:
+            continue
+        marks: list[str] = []
+        if att.get("self"):
+            marks.append("the person whose laptop is recording")
+        if att.get("organizer"):
+            marks.append("organiser")
+        if email:
+            marks.append(f"name guessed from {email}" if att.get("guessed_name") else email)
+        lines.append(f"{name or email}" + (f" — {'; '.join(marks)}" if marks else ""))
+    return lines
+
+
+def roster_block(event: dict | None) -> str:
+    """The invite, phrased so it guides attribution without licensing invention.
+
+    The failure this is written against is the confident one: hand a model six names
+    and a six-voice transcript and it will pair them off. So the block says what the
+    roster *is* (who was asked, not who spoke), names the two ways it lies (someone
+    invited stays silent, someone uninvited joins), and flags which names are our own
+    guesses off an email address.
+    """
+    people = attendee_lines(event)
+    if not people:
+        return ""
+    event = event or {}
+    heading = "Invited to this meeting"
+    title = (event.get("summary") or "").strip()
+    when = (event.get("start") or "").strip()
+    if title:
+        heading += f', from the calendar entry "{title}"'
+    if when:
+        heading += f" ({when})"
+    block = [f"{heading}:"]
+    block += [f"- {line}" for line in people]
+    agenda = (event.get("description") or "").strip()
+    if agenda:
+        block.append("")
+        block.append("What the invite said the meeting was about:")
+        block.append(agenda)
+    block.append("")
+    block.append(
+        "Use this roster to attribute turns, with its limits in mind. It says who was\n"
+        "*invited*, not who spoke: someone on it may never say a word, and someone not on\n"
+        "it may well be in the room. A name marked \"guessed from\" was derived from an\n"
+        "email address by us and may be wrong.\n"
+        "\n"
+        "So: prefer a roster name when the audio supports it — the speaker introduces\n"
+        "themselves, is addressed by name, owns the agenda, or is plainly the only person\n"
+        "they can be — and keep a neutral label like \"Speaker 2 (client)\" when it does not.\n"
+        "Do not assign a roster name on the strength of the roster alone, and do not assume\n"
+        "the number of speakers matches the number of people invited. In the Speakers\n"
+        "legend, say what each mapping rests on (\"introduces herself at the top\", \"only\n"
+        "other person on the invite\"), and list anyone invited you never heard speak."
+    )
+    return "\n".join(block)
+
+
+def build_cleanup_prompt(
+    raw_txt: Path,
+    audio: Path,
+    diarized_txt: Path | None = None,
+    event: dict | None = None,
+) -> str:
     """The cleanup instruction plus the transcript, shared by both engines.
 
     Kept engine-agnostic so `claude -p` and OpenRouter clean identically — the
@@ -1934,6 +2253,8 @@ def build_cleanup_prompt(raw_txt: Path, audio: Path, diarized_txt: Path | None =
             "\"Speaker 1 (host/presenter)\" or \"Speaker 2 (client)\". Do NOT guess specific names "
             "without support. Add a short Speakers legend at the top listing who each label is."
         )
+    roster = roster_block(event)
+    roster_section = f"\n{roster}\n" if roster else ""
     prompt = f"""
 You are cleaning a machine-generated transcript of a meeting.
 
@@ -1941,7 +2262,7 @@ Input audio path: {audio}
 Raw transcript path: {raw_txt}
 
 Speaker labels: {speaker_note}
-
+{roster_section}
 Produce markdown with:
 - Title inferred from content if possible
 - Date/time from the filename if useful
@@ -2052,6 +2373,7 @@ def clean_with_claude(
     audio: Path,
     diarized_txt: Path | None = None,
     preserve_on_failure: bool = False,
+    event: dict | None = None,
 ) -> bool:
     """Clean the transcript into notes at `final_md`. Returns True on success.
 
@@ -2059,7 +2381,7 @@ def clean_with_claude(
     the same way transcription falls back to local Whisper. Named for the
     subprocess it originally wrapped; kept for callers and the .claude.log path.
     """
-    prompt = build_cleanup_prompt(raw_txt, audio, diarized_txt=diarized_txt)
+    prompt = build_cleanup_prompt(raw_txt, audio, diarized_txt=diarized_txt, event=event)
 
     if CLEANUP_ENGINE == "openrouter":
         log_section("openrouter cleanup started", model=OPENROUTER_CLEANUP_MODEL,
@@ -2679,7 +3001,7 @@ def diarized_transcript_for(md_file: Path) -> Path | None:
 
 def audio_for_meeting(md_file: Path) -> Path | None:
     stem = meeting_stem(md_file)
-    for suffix in (".wav", ".m4a", ".mp3", ".aac", ".flac"):
+    for suffix in AUDIO_SUFFIXES:
         candidate = md_file.parent.parent / f"{stem}{suffix}"
         if candidate.exists():
             return candidate
@@ -2716,12 +3038,15 @@ def rerun_cleanup(path: str | None, open_after: bool = False) -> int:
         print(f"no raw transcript next to {display_path(md_file)}", file=sys.stderr)
         return 1
     audio = audio_for_meeting(md_file) or md_file
+    # A rerun looks the invite up the same way, which is what lets an old recording
+    # gain speaker names it never had: the notes are rebuilt with the roster attached.
     ok = clean_with_claude(
         raw_txt,
         md_file,
         audio,
         diarized_txt=diarized_transcript_for(md_file),
         preserve_on_failure=True,
+        event=event_for_recording(audio),
     )
     if not ok:
         print(f"cleanup failed; kept existing notes: {display_path(md_file)}", file=sys.stderr)
@@ -3411,6 +3736,55 @@ def status_launch_agent() -> int:
     return 0
 
 
+def backfill_events(limit: int = 0, force: bool = False) -> int:
+    """Ask the calendar who was in each past recording and cache the answer.
+
+    Naming already used the calendar, so most of the archive *was* matched once —
+    but only the title was kept and the roster was thrown away. This goes back for
+    it, oldest first, and writes the same sidecar a recording started today would
+    have. Everything downstream (the meetings app, a cleanup rerun) then reads one
+    file rather than making a network call per recording.
+
+    Recordings whose sidecar already exists are skipped unless `force`, so this is
+    safe to re-run: the expensive part is the calendar, and it is only asked about
+    what is genuinely missing.
+    """
+    if not command_exists(GOG_BIN):
+        print(f"{GOG_BIN} not found — nothing to ask", file=sys.stderr)
+        return 1
+    audios = sorted(
+        (path for path in ROOT.glob("*") if path.suffix.lower() in AUDIO_SUFFIXES),
+        key=lambda p: p.name,
+    )
+    matched = skipped = missed = unparsed = 0
+    for audio in audios:
+        if limit and (matched + missed) >= limit:
+            break
+        if not force and event_sidecar_for(audio).exists():
+            skipped += 1
+            continue
+        parsed = parse_recording_stem(audio.stem)
+        if parsed is None:
+            unparsed += 1
+            continue
+        when, name_slug = parsed
+        ev = best_event_at(when, day=when.date(), want_slug=name_slug)
+        if ev is None:
+            missed += 1
+            print(f"  no calendar event  {audio.stem}")
+            continue
+        trimmed = trim_event(ev)
+        write_event_sidecar(audio, trimmed)
+        matched += 1
+        who = ", ".join(a["name"] for a in trimmed["attendees"]) or "no attendees listed"
+        print(f"  {trimmed['summary']}  <-  {audio.stem}\n      {who}")
+    print(
+        f"\n{matched} matched, {missed} with nothing on the calendar, "
+        f"{skipped} already had one, {unparsed} unrecognised filenames"
+    )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Detect, record, and transcribe meetings on macOS.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -3450,6 +3824,11 @@ def main() -> int:
     tr_job = sub.add_parser("transcribe-job", help=argparse.SUPPRESS)
     tr_job.add_argument("audio")
     sub.add_parser("serve-transcripts", help=argparse.SUPPRESS)
+    backfill = sub.add_parser(
+        "backfill-events",
+        help="look up the calendar invite behind past recordings and cache it beside them")
+    backfill.add_argument("--limit", type=int, default=0, help="stop after N lookups")
+    backfill.add_argument("--force", action="store_true", help="re-ask even where a sidecar exists")
     args = parser.parse_args()
 
     if args.command == "watch":
@@ -3465,6 +3844,8 @@ def main() -> int:
         return open_transcript(args.path)
     if args.command == "serve-transcripts":
         return _run_transcript_server()
+    if args.command == "backfill-events":
+        return backfill_events(limit=args.limit, force=args.force)
     if args.command == "rerun-cleanup":
         return rerun_cleanup(args.path, open_after=args.open)
     if args.command == "doctor":
