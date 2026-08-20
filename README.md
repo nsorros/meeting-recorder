@@ -466,6 +466,64 @@ missing, offline, or slow (past `MEETING_RECORDER_CALENDAR_TIMEOUT`), it silentl
 falls back to the tab title. Set `MEETING_RECORDER_CALENDAR=0` to skip the
 calendar step entirely.
 
+## Who Was In The Room
+
+The calendar was always asked what a meeting was *called*, and the guest list was
+thrown away with the rest of the reply. It is kept now, because it is the one thing
+that lets the cleanup put names to voices: a transcript has no idea who is speaking,
+but an invite says who was asked.
+
+When a recording starts, the matched event is trimmed to what is worth keeping
+forever — title, times, agenda, Meet link, and every guest — and written beside the
+audio as `<stem>.event.json`. It is written **then**, not later: the calendar is only
+ever asked what is happening *now*, and an hour after the meeting the answer has moved
+on. A calendar entry is also edited and eventually deleted, while a recording is not,
+so what the invite said at the moment of recording is the version that survives.
+
+A guest with no `displayName` gets a name inferred from their address
+(`persefoni@finant.ai` → *Persefoni*), and that inference is **labelled as one**
+everywhere it travels.
+
+### What the cleanup is told
+
+The roster goes into the cleanup prompt as evidence, never as an answer key. The
+failure being guarded against is the confident one: hand a model six names and a
+six-voice transcript and it will pair them off, and the result reads exactly like
+knowledge. So the block says what the roster is (who was *invited* — someone on it may
+never speak, someone not on it may be in the room), marks which names are our guesses
+off an address, names the laptop's owner, and asks the Speakers legend to say what each
+mapping rests on and to list anyone invited who was never heard.
+
+**Declined invitations are dropped before the prompt sees them.** Someone who said no
+is precisely the name a model would otherwise hang a spare voice on. Guests who never
+answered are kept — turning up without replying is the ordinary case.
+
+None of this is load-bearing. A recording with no matching event produces the prompt
+exactly as it was before rosters existed: no empty heading, no instruction about a list
+that is not there.
+
+### The archive
+
+```sh
+mrec backfill-events            # ask the calendar about past recordings, cache the answers
+mrec backfill-events --force    # re-ask even where a sidecar already exists
+mrec rerun-cleanup <notes.md>   # rebuild notes — now with the roster attached
+```
+
+The timestamp in a recording's filename is enough to go back and ask, and `backfill-events`
+does that for the whole archive, oldest first, skipping anything already answered. It
+scores candidates the way live naming does, except that the winning signal live — a Meet
+room code open in a browser tab — no longer exists, so the recording's own slug decides
+instead.
+
+A **miss is deliberately not cached**. "Nothing was scheduled" and "the network was down"
+both arrive as no answer, and writing the second one down would make a passing failure
+permanent. Callers that cannot afford a network round trip per recording (the meetings
+app listing the whole archive) pass `lookup=False` and read only what is already there.
+
+Rerunning cleanup looks the roster up the same way, which is what lets an old recording
+gain speaker names it never had.
+
 ## Configuration
 
 Environment variables:
