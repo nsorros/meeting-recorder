@@ -587,6 +587,43 @@ def clear_watcher_status() -> None:
 
 
 _transcribe_job_state: dict[str, object] = {}
+# A percent change is what triggers republishing progress, but on a short
+# recording that fires ~100 times in a minute — each one a file write and a menu
+# bar refresh. Rate-limit it to something a human can actually read.
+PROGRESS_MIN_SECONDS = 10
+
+
+def _publish_transcribe_job() -> None:
+    """Write this process's job file from `_transcribe_job_state`, then nudge the menu.
+
+    Every publisher goes through here so the file always carries the whole state:
+    a progress update must not drop the engine line, and vice versa.
+    """
+    state = _transcribe_job_state
+    if not state.get("audio"):
+        return
+    lines = [
+        f"pid={os.getpid()}",
+        f"state={state.get('state', '')}",
+        f"audio={state['audio']}",
+        f"meeting={state.get('meeting', '')}",
+        # Not a get() default: that would call time.time() on every publish, and
+        # `since` is always stamped by write_transcribe_job before we get here.
+        f"since={state['since'] if 'since' in state else int(time.time())}",
+    ]
+    # Only the keys we actually know: a reader treats a missing key as "unknown",
+    # where an empty value would render as a blank engine name or a 0% progress.
+    for key in ("engine", "model", "percent", "eta"):
+        if state.get(key) not in (None, ""):
+            lines.append(f"{key}={state[key]}")
+    try:
+        TRANSCRIBE_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        (TRANSCRIBE_JOBS_DIR / str(os.getpid())).write_text(
+            "\n".join(lines) + "\n", encoding="utf-8",
+        )
+    except Exception as exc:
+        log(f"could not write transcribe job state: {exc}")
+    swiftbar_refresh()
 
 
 def write_transcribe_job(audio: Path, state: str) -> None:
@@ -600,18 +637,74 @@ def write_transcribe_job(audio: Path, state: str) -> None:
     """
     if _transcribe_job_state.get("state") == state:
         return
-    since = _transcribe_job_state.setdefault("since", int(time.time()))
+    _transcribe_job_state.setdefault("since", int(time.time()))
     _transcribe_job_state["state"] = state
-    try:
-        TRANSCRIBE_JOBS_DIR.mkdir(parents=True, exist_ok=True)
-        (TRANSCRIBE_JOBS_DIR / str(os.getpid())).write_text(
-            f"pid={os.getpid()}\nstate={state}\naudio={audio}\n"
-            f"meeting={recording_display_name(audio)}\nsince={since}\n",
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        log(f"could not write transcribe job state: {exc}")
-    swiftbar_refresh()
+    _transcribe_job_state["audio"] = str(audio)
+    _transcribe_job_state["meeting"] = recording_display_name(audio)
+    _publish_transcribe_job()
+
+
+def write_transcribe_engine(engine: str, model: str) -> None:
+    """Publish which engine is actually doing this job — not the one that was planned.
+
+    The menu bar's "next transcription" line reads the plan. A job that started on
+    OpenRouter and fell back to local Whisper mid-run (a dead network did exactly
+    that on 2026-08-25) then contradicts that line for the next hour, with nothing
+    on screen saying so. Whoever transcribes says what it is.
+    """
+    if not _transcribe_job_state.get("audio"):
+        return  # not running as a published job (e.g. a plain `mrec transcribe`)
+    if (_transcribe_job_state.get("engine"), _transcribe_job_state.get("model")) == (engine, model):
+        return
+    _transcribe_job_state["engine"] = engine
+    _transcribe_job_state["model"] = model
+    # Progress belongs to the engine that reported it: a fallback restarts the
+    # audio from zero, so carrying 60% across would freeze the menu at 60% while
+    # the new engine works its way back up.
+    for key in ("percent", "eta", "anchor_done", "anchor_at"):
+        _transcribe_job_state.pop(key, None)
+    _publish_transcribe_job()
+
+
+def write_transcribe_progress(done_seconds: float, total_seconds: float) -> None:
+    """Publish how far into the audio this job has got, plus a wall-clock ETA.
+
+    Both engines work strictly forward through the audio, so position/duration is
+    an honest fraction. It is capped at 99%: local Whisper reaches the last
+    segment well before it has written its output files, and a menu bar sitting at
+    100% for minutes reads as a hung job.
+    """
+    if not _transcribe_job_state.get("audio") or total_seconds <= 0:
+        return
+    percent = max(0, min(99, int(done_seconds / total_seconds * 100)))
+    if _transcribe_job_state.get("percent") == percent:
+        return
+    now = time.time()
+    # The rate limit applies between updates, never to the first one: that one
+    # carries the news that this job has started moving at all.
+    last = _transcribe_job_state.get("progress_at")
+    if last is not None and percent < 99 and now - float(last) < PROGRESS_MIN_SECONDS:
+        return
+    _transcribe_job_state["percent"] = percent
+    _transcribe_job_state["progress_at"] = now
+    # Rate is measured from the first report onwards, not from the start of the
+    # job: Whisper spends its first ~45s loading the model without decoding a
+    # thing, and counting that made a 45s clip's first ETA read 12 minutes. The
+    # anchor is the whole run since then, not the last update — per-segment speed
+    # swings wildly (silence is near-instant, crosstalk is slow) and a jittering
+    # ETA is worse than no ETA. The first report has no rate yet, so no ETA.
+    anchor_done = _transcribe_job_state.get("anchor_done")
+    anchor_at = _transcribe_job_state.get("anchor_at")
+    if anchor_done is None or anchor_at is None:
+        _transcribe_job_state["anchor_done"] = done_seconds
+        _transcribe_job_state["anchor_at"] = now
+    else:
+        advanced = done_seconds - float(anchor_done)
+        elapsed = now - float(anchor_at)
+        if advanced > 0 and elapsed > 0:
+            rate = advanced / elapsed
+            _transcribe_job_state["eta"] = max(0, int((total_seconds - done_seconds) / rate))
+    _publish_transcribe_job()
 
 
 def clear_transcribe_job() -> None:
@@ -1814,6 +1907,25 @@ def transcribe_audio(audio: Path) -> Path:
     return final_md
 
 
+_WHISPER_SEGMENT_END_RE = re.compile(r"-->\s*(?:(\d+):)?(\d{2}):(\d{2})\.(\d{3})\]")
+
+
+def whisper_segment_end(line: str) -> float | None:
+    """Seconds into the audio that a printed Whisper segment line reached, or None.
+
+    Whisper's verbose output is one line per decoded segment —
+    ``[00:12.000 --> 00:15.480]  some words`` — and the hour field only appears
+    once there is one, hence the optional group. That end timestamp is the only
+    progress signal the CLI gives us (its tqdm bar is suppressed whenever verbose
+    output is on, which is the default and what makes whisper.log worth keeping).
+    """
+    match = _WHISPER_SEGMENT_END_RE.search(line)
+    if not match:
+        return None
+    hours, minutes, seconds, millis = match.groups()
+    return int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000
+
+
 def transcribe_with_whisper(audio: Path, out_dir: Path) -> Path:
     """Local Whisper transcription. Returns the raw .txt transcript path."""
     cmd = ["whisper", str(audio), "--model", WHISPER_MODEL, "--output_dir", str(out_dir), "--output_format", "all"]
@@ -1829,10 +1941,28 @@ def transcribe_with_whisper(audio: Path, out_dir: Path) -> Path:
         cmd.extend(["--language", LANGUAGE])
     log_section("transcription started", audio_file=display_path(audio), output_dir=display_path(out_dir), engine="whisper")
     log("whisper command: " + shlex.join(cmd))
-    proc = subprocess.run(cmd, text=True, capture_output=True)
-    (out_dir / "whisper.log").write_text(proc.stdout + "\n" + proc.stderr, encoding="utf-8")
-    if proc.returncode != 0:
-        raise RuntimeError(f"whisper failed; see {out_dir / 'whisper.log'}")
+    write_transcribe_engine("whisper", WHISPER_MODEL)
+    total = audio_duration_seconds(audio) or 0.0
+    # Read the output as it is produced rather than collecting it at the end: on an
+    # hour of audio that is the difference between a menu bar that shows progress
+    # and one that shows nothing for ninety minutes. PYTHONUNBUFFERED because
+    # whisper's per-segment print() would otherwise sit in a 4 KB pipe buffer and
+    # arrive in bursts. Streaming into whisper.log also means a run killed
+    # mid-flight leaves the partial log behind instead of nothing.
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    log_path = out_dir / "whisper.log"
+    with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+        proc = subprocess.Popen(cmd, text=True, errors="replace", env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+        for line in proc.stdout:
+            log_file.write(line)
+            log_file.flush()
+            end = whisper_segment_end(line)
+            if end is not None:
+                write_transcribe_progress(end, total)
+        returncode = proc.wait()
+    if returncode != 0:
+        raise RuntimeError(f"whisper failed; see {log_path}")
 
     raw_txt = out_dir / f"{audio.stem}.txt"
     if not raw_txt.exists():
@@ -2105,6 +2235,7 @@ def transcribe_with_openrouter(audio: Path, out_dir: Path) -> Path:
 
     log_section("transcription started", audio_file=display_path(audio),
                 output_dir=display_path(out_dir), engine=f"openrouter:{OPENROUTER_MODEL}")
+    write_transcribe_engine("openrouter", OPENROUTER_MODEL)
     duration = audio_duration_seconds(audio) or 0.0
     nchunks = max(1, int(math.ceil(duration / OPENROUTER_CHUNK_SECONDS))) if duration else 1
     parts: list[str] = []
@@ -2130,6 +2261,9 @@ def transcribe_with_openrouter(audio: Path, out_dir: Path) -> Path:
                 parts.append(text)
             cost = float((usage or {}).get("cost") or 0.0)
             log(f"openrouter chunk {idx + 1}/{nchunks} done ({len(text)} chars, ${cost:.4f})")
+            # Chunk boundaries are the only progress this engine has; with the
+            # default chunk size that is a menu bar update every few minutes.
+            write_transcribe_progress(min(start + OPENROUTER_CHUNK_SECONDS, duration), duration)
     if not parts:
         raise RuntimeError("openrouter returned no transcript text")
     raw_txt = out_dir / f"{audio.stem}.txt"
@@ -3770,7 +3904,16 @@ def status_launch_agent() -> int:
     # nothing about whether one is still working. List them explicitly.
     for job in transcribe_jobs():
         verb = "queued" if job.get("state") == "queued" else "transcribing"
-        print(f"{verb}: {job.get('meeting', '?')} (pid {job.get('pid', '?')})")
+        line = f"{verb}: {job.get('meeting', '?')} (pid {job.get('pid', '?')})"
+        # Same progress the menu bar shows — a terminal check should not have to
+        # be the less informative one.
+        detail = [bit for bit in (job.get("engine"), f"{job['percent']}%" if job.get("percent") else "")
+                  if bit]
+        if job.get("eta"):
+            detail.append(f"~{int(job['eta']) // 60}m left")
+        if detail:
+            line += "  " + ", ".join(detail)
+        print(line)
     print(f"Log: {display_path(LOG)}")
     return 0
 
