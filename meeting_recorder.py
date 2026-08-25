@@ -1387,6 +1387,18 @@ EVENT_SUFFIX = ".event.json"
 # now, the rest are the archive's.
 AUDIO_SUFFIXES = (".wav", ".m4a", ".mp3", ".aac", ".flac")
 RECORDING_STEM_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})(?:_(.*))?$")
+# The two WAVs ScreenCaptureKit writes on the way to `<stem>.wav`. They are supposed to
+# be mixed and deleted before anything else sees them, and a clean run never leaves one
+# behind — but a capture that dies early does, and a leftover is worse than clutter: its
+# own stem parses as a recording (`RECORDING_STEM_RE`'s slug group swallows the
+# `.system`), so anything walking this directory mints it a sidecar and draws it as a
+# meeting that never happened. Recognising them by name is what stops that.
+CAPTURE_PART_SUFFIXES = (".system", ".mic")
+
+
+def is_capture_part(audio: Path) -> bool:
+    """Is this one of the intermediates a capture writes, rather than a recording?"""
+    return Path(audio.stem).suffix in CAPTURE_PART_SUFFIXES
 
 
 def event_sidecar_for(audio: Path) -> Path:
@@ -1444,7 +1456,7 @@ def event_for_recording(audio: Path, *, lookup: bool = True) -> dict | None:
     cached = read_event_sidecar(audio)
     if cached is not None:
         return cached
-    if not lookup:
+    if not lookup or is_capture_part(audio):
         return None
     parsed = parse_recording_stem(audio.stem)
     if parsed is None:
@@ -1544,6 +1556,12 @@ def _start_screencapturekit(reason: str, path: Path) -> subprocess.Popen[bytes] 
         except OSError:
             pass
         log(f"sck: recorder exited early (rc={proc.returncode}): {err}")
+        # Nothing was captured, but the helper may already have opened its files — a
+        # declined Screen Recording prompt has left a header-only `.system.wav` here
+        # before. The caller falls back to ffmpeg writing straight to `<stem>.wav`, so
+        # `_mix_capture_parts` never runs for this recording and this is the only
+        # chance to clear them. The log stays: it is why this failed.
+        _discard_capture_parts(system_wav, mic_wav)
         return None
 
     proc.mr_backend = "screencapturekit"  # type: ignore[attr-defined]
@@ -1662,44 +1680,65 @@ def _stop_screencapturekit(proc: subprocess.Popen[bytes]) -> None:
         _mix_capture_parts(parts, final)
 
 
+def _discard_capture_parts(*parts: Path | None) -> None:
+    """Remove the capture intermediates. Never fatal — but never skipped either.
+
+    See `CAPTURE_PART_SUFFIXES`: one of these left on disk becomes a phantom meeting
+    downstream, so every path out of a capture goes through here. The `.sck.log` is
+    deliberately not in the list — that one is the diagnostic record of what went
+    wrong, and it is the only thing left to read when a capture produced nothing."""
+    for part in parts:
+        if not part:
+            continue
+        try:
+            part.unlink()
+        except OSError:
+            pass
+
+
 def _mix_capture_parts(parts: list[Path], final: Path) -> None:
     """Mix the system-audio and mic WAVs into a single mono file for transcription.
 
     amix with normalize=0 keeps both sources at full level (they rarely peak at
     once, and Whisper/Gemini are tolerant of the occasional overlap). If only one
-    source produced audio we just transcode that. On any failure we preserve the
-    system-audio track (the far side) so a meeting is never silently lost."""
+    source produced audio we just transcode that. On any failure we preserve
+    whichever track we did get so a meeting is never silently lost.
+
+    Whatever happens, the intermediates do not outlive this call: `final` is the
+    only file that leaves here."""
     system_wav, mic_wav = parts[0], parts[1] if len(parts) > 1 else None
-    have_sys = system_wav.exists() and system_wav.stat().st_size > 1024
-    have_mic = bool(mic_wav) and mic_wav.exists() and mic_wav.stat().st_size > 1024
+    try:
+        have_sys = system_wav.exists() and system_wav.stat().st_size > 1024
+        have_mic = bool(mic_wav) and mic_wav.exists() and mic_wav.stat().st_size > 1024
 
-    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y"]
-    if have_sys and have_mic:
-        cmd += [
-            "-i", str(system_wav), "-i", str(mic_wav),
-            "-filter_complex", "amix=inputs=2:duration=longest:dropout_transition=0:normalize=0",
-        ]
-    elif have_sys:
-        cmd += ["-i", str(system_wav)]
-    elif have_mic:
-        cmd += ["-i", str(mic_wav)]
-    else:
-        log("sck: no audio captured (system and mic both empty) — check Screen Recording permission / audio output")
-        return
-    cmd += ["-ac", "1", "-ar", SAMPLE_RATE, "-acodec", "pcm_s16le", str(final)]
+        cmd = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error", "-y"]
+        if have_sys and have_mic:
+            cmd += [
+                "-i", str(system_wav), "-i", str(mic_wav),
+                "-filter_complex", "amix=inputs=2:duration=longest:dropout_transition=0:normalize=0",
+            ]
+        elif have_sys:
+            cmd += ["-i", str(system_wav)]
+        elif have_mic:
+            cmd += ["-i", str(mic_wav)]
+        else:
+            log("sck: no audio captured (system and mic both empty) — check Screen Recording permission / audio output")
+            return
+        cmd += ["-ac", "1", "-ar", SAMPLE_RATE, "-acodec", "pcm_s16le", str(final)]
 
-    res = run(cmd, timeout=180)
-    if res.returncode != 0:
-        log(f"sck: mixing failed ({res.stderr.strip() or res.stdout.strip()})")
-        if have_sys and not final.exists():
-            shutil.copyfile(system_wav, final)  # don't lose the far-side audio
-        return
-    for part in (system_wav, mic_wav):
-        if part:
-            try:
-                part.unlink()
-            except OSError:
-                pass
+        res = run(cmd, timeout=180)
+        if res.returncode != 0:
+            log(f"sck: mixing failed ({res.stderr.strip() or res.stdout.strip()})")
+            # The mix is what we lost, not the audio. Rescue a source before the
+            # cleanup below takes it — the far side first, the mic if that is all
+            # there was, because either beats an empty file.
+            if not final.exists():
+                rescue = system_wav if have_sys else (mic_wav if have_mic else None)
+                if rescue:
+                    shutil.copyfile(rescue, final)
+            return
+    finally:
+        _discard_capture_parts(system_wav, mic_wav)
 
 
 def audio_duration_seconds(audio: Path) -> float | None:
@@ -3753,7 +3792,8 @@ def backfill_events(limit: int = 0, force: bool = False) -> int:
         print(f"{GOG_BIN} not found — nothing to ask", file=sys.stderr)
         return 1
     audios = sorted(
-        (path for path in ROOT.glob("*") if path.suffix.lower() in AUDIO_SUFFIXES),
+        (path for path in ROOT.glob("*")
+         if path.suffix.lower() in AUDIO_SUFFIXES and not is_capture_part(path)),
         key=lambda p: p.name,
     )
     matched = skipped = missed = unparsed = 0
