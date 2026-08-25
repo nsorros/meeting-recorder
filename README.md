@@ -420,9 +420,10 @@ The menu shows:
 
 - clock `Waiting`: watcher running, no meeting in progress
 - filled record circle `Rec <elapsed>`: a recording is running — with a `⧗` suffix when a transcription is also running behind it
-- `Transcribing…`: transcribing a finished meeting, with a line per in-flight job (`⏳ Transcribing: <meeting>`, `⏸ Queued for transcription: <meeting>`)
+- `Transcribing 63%`: transcribing a finished meeting, with a line per in-flight job (`⏳ Transcribing: <meeting>`, `⏸ Queued for transcription: <meeting>`)
 - waveform-slash `Off`: watcher stopped
-- **which engine the next transcription will use**, plus the OpenRouter balance (`Transcribes with: gemini-2.5-flash · $7.33 left`), turning red when it has degraded to Whisper or the balance is nearly out
+- **live progress** under each running job — the engine actually doing it, a bar, and a wall-clock estimate (`local whisper (turbo) · ▮▮▮▮▮▮▯▯▯▯ 63% · ~26m left`). See [Transcription Progress](#transcription-progress)
+- **which engine the next transcription will use**, plus the OpenRouter balance (`Next transcription: gemini-2.5-flash · $7.33 left`), turning red when it has degraded to Whisper or the balance is nearly out
 - the **last recording** and **last transcript**, each with their age and a one-click action to play / open them
 
 The plugin polls once a minute, but the watcher also nudges it to re-run the
@@ -430,6 +431,36 @@ instant the state changes (via SwiftBar's `refreshplugin` URL scheme), so the
 title flips between `Rec` / `Transcribing…` / `Listening` immediately rather than
 trailing the real state by up to a poll. Best-effort — disable with
 `MEETING_RECORDER_MENUBAR_REFRESH=0`.
+
+### Transcription Progress
+
+An hour of audio takes local Whisper more than an hour on this machine, and for
+all of it the menu bar used to say only `Transcribing…` — no way to tell a slow
+job from a wedged one. Each job now publishes its position into its own job file
+under `~/.local/state/meeting-recorder/transcribe-jobs/<pid>`, which is what the
+menu bar renders:
+
+- **Whisper** prints one line per decoded segment (`[00:12.000 --> 00:15.480] …`).
+  We read its output as it is produced instead of collecting it at the end, and
+  the end timestamp of the newest segment divided by the audio duration is the
+  progress. (A side effect worth having: `whisper.log` is now written as the run
+  goes, so a job killed mid-flight still leaves its log behind.)
+- **OpenRouter** reports at chunk boundaries — with the default chunk size, an
+  update every few minutes.
+
+Two things to know about the numbers. Progress is capped at **99%**: Whisper
+reaches its last segment well before it has written its output files, and a menu
+bar parked at 100% reads as a hung job. And the ETA is measured from the first
+segment onwards, not from the start of the run — Whisper spends its first ~45s
+loading the model without decoding anything, and counting that made a 45-second
+clip's first estimate read twelve minutes.
+
+Each job also publishes **which engine is actually running it**, which is not
+always the one `mrec engine` planned: a job that starts on OpenRouter and falls
+back to local Whisper mid-run (a DNS failure did exactly that on 2026-08-25) used
+to leave the menu naming an engine that was not running, for the next hour. The
+plan line is now labelled `Next transcription:` and the running engine appears
+under the job itself.
 
 When a transcript is ready, a popup announces it (`Transcript ready for "<meeting
 name>".`) with an **Open transcript** button — the same action as the menu bar's

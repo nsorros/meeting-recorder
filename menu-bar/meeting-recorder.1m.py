@@ -133,6 +133,46 @@ def latest_transcript() -> Path | None:
     return max(md, key=lambda p: p.stat().st_mtime, default=None)
 
 
+def percent(job: dict[str, str]) -> int | None:
+    """This job's progress through the audio, or None if it hasn't reported any."""
+    try:
+        return max(0, min(100, int(job.get("percent", ""))))
+    except ValueError:
+        return None
+
+
+def duration(seconds: str) -> str:
+    """A rough spoken-length duration: 45s, 12m, 1h05m."""
+    try:
+        secs = int(seconds)
+    except ValueError:
+        return ""
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def engine_label(job: dict[str, str]) -> str:
+    """What is actually transcribing this job — not what `mrec engine` plans next.
+
+    The two disagree whenever a job falls back from OpenRouter to local Whisper,
+    which is exactly when knowing the difference matters.
+    """
+    engine, model = job.get("engine", ""), job.get("model", "")
+    if not engine:
+        return ""
+    if engine == "openrouter":
+        return model.split("/")[-1] or engine
+    return f"local whisper ({model})" if model else "local whisper"
+
+
+def progress_bar(pct: int, width: int = 10) -> str:
+    filled = round(pct / 100 * width)
+    return "▮" * filled + "▯" * (width - filled)
+
+
 def elapsed(since: str) -> str:
     try:
         secs = int(time.time()) - int(since)
@@ -169,7 +209,10 @@ def print_engine_section() -> None:
         label = model.split("/")[-1]
     else:
         label = f"local whisper ({model})"
-    line = f"Transcribes with: {label}"
+    # "Next", not "Transcribes with": this is the plan for the next job, and a job
+    # already running may have fallen back to a different engine — which its own
+    # line above reports.
+    line = f"Next transcription: {label}"
     credits = plan.get("credits")
     if credits:
         line += f"  ·  ${credits['remaining']:.2f} left"
@@ -206,13 +249,21 @@ def main() -> None:
     # Menu bar title signals the current state at a glance. Recording outranks
     # transcribing: the two overlap now, and the live capture is the one worth
     # knowing about — the ⧗ suffix says a transcription is running behind it.
+    # The furthest-along job drives the title: with a queue behind it, that is the
+    # one whose finish actually frees the machine.
+    pcts = [p for p in (percent(job) for job in jobs) if p is not None]
+    lead = max(pcts) if pcts else None
     if recording:
         since = manual.get("started_at", "") if manual else status.get("since", "")
         mins = elapsed(since)
-        title = f"Rec {mins}".strip() + (" ⧗" if jobs else "")
+        title = f"Rec {mins}".strip()
+        if jobs:
+            title += f" ⧗{lead}%" if lead is not None else " ⧗"
         menu_title(title, "record.circle.fill", color="red")
     elif jobs:
-        menu_title("Transcribing…", "ellipsis.circle")
+        # Only the percentage moves, so the title's width stays put as it climbs.
+        menu_title(f"Transcribing {lead}%" if lead is not None else "Transcribing…",
+                   "ellipsis.circle")
     elif watcher:
         menu_title("Listening", "waveform")
     else:
@@ -229,8 +280,21 @@ def main() -> None:
         age = elapsed(job.get("since", ""))
         if job.get("state") == "queued":
             print(f"⏸ Queued for transcription: {name}")
-        else:
-            print(f"⏳ Transcribing: {name}  ({age})".rstrip())
+            continue
+        print(f"⏳ Transcribing: {name}  ({age})".rstrip())
+        # Detail on its own dimmed line: engine first (it decides how long this
+        # will take), then the bar, then how much longer.
+        pct = percent(job)
+        bits = [engine_label(job)]
+        if pct is not None:
+            bits.append(f"{progress_bar(pct)} {pct}%")
+            left = duration(job.get("eta", ""))
+            if left:
+                bits.append(f"~{left} left")
+        # "|" would be read as the start of xbar's parameter list.
+        detail = "  ·  ".join(bit for bit in bits if bit).replace("|", "/")
+        if detail:
+            print(f"    {detail} | size=11 color=#8e8e8e")
     print(f"Watcher: {'running' if watcher else 'stopped'}")
     print_engine_section()
 
