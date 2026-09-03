@@ -28,8 +28,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 from xml.sax.saxutils import escape
 
 
@@ -258,6 +261,31 @@ OPENROUTER_PROMPT = os.environ.get(
 # the environment (e.g. the ant app's ~/code/ant/.env). Only the key line is read.
 OPENROUTER_ENV_FILE = _setting("MEETING_RECORDER_OPENROUTER_ENV_FILE", "openrouter_env_file")
 OPENROUTER_CREDITS_TIMEOUT = int(os.environ.get("MEETING_RECORDER_OPENROUTER_CREDITS_TIMEOUT", "10"))
+# Both ASR engines sometimes fall into a repetition loop: the model locks onto a
+# phrase and emits it until the chunk ends. It is not an error — the call returns
+# 200 with plausible text — so nothing downstream noticed until a recap arrived
+# built on 493 copies of "He's good." (2026-09-02). Scoring all 65 transcripts in
+# the archive for longest run of identical sentences and share of unique ones
+# separates the nine bad captures from the other 56 with room to spare:
+#
+#   degenerate  runs 65535 65535 8034 1249 493 49 24 2 1
+#               unique 0.00 0.01 0.02 0.07 0.19 0.28 0.85 0.19 0.14
+#   healthy     runs 5 at worst, unique 0.83 at worst
+#
+# Both thresholds land in open space. Every bad capture either runs past 24 or
+# falls under 0.28 unique; no healthy one runs past 5 or drops below 0.83. (The
+# 24-run capture is 0.85 unique — a degenerate opening on an otherwise fine call,
+# which is why the run test cannot be dropped in favour of the ratio alone.)
+#
+# Two tests are needed, not one. The run catches the classic lock-up; the unique
+# ratio catches 2026-08-26, where the repeats interleave with real speech (run of
+# 1, 0.14 unique) and where the lost budget action item came from. The unit floor
+# keeps a genuinely short chunk — "Yeah." "Yeah." and an empty room — from
+# tripping the ratio.
+DEGENERATION_MAX_RUN = int(os.environ.get("MEETING_RECORDER_DEGENERATION_MAX_RUN", "20"))
+DEGENERATION_MIN_UNIQUE_RATIO = float(
+    os.environ.get("MEETING_RECORDER_DEGENERATION_MIN_UNIQUE_RATIO", "0.5"))
+DEGENERATION_MIN_UNITS = int(os.environ.get("MEETING_RECORDER_DEGENERATION_MIN_UNITS", "40"))
 # Once the balance hits zero OpenRouter answers 402 and every transcription
 # silently downgrades to local Whisper, so warn while there is still time to top
 # up. Roughly: $0.12 buys an hour of audio on Gemini Flash.
@@ -1865,6 +1893,79 @@ def audio_mean_volume_db(audio: Path) -> float | None:
     return float(m.group(1)) if m else None
 
 
+_TRANSCRIPT_UNIT_RE = re.compile(r"[^.!?]*[.!?]|[^.!?]+$")
+
+
+class DegenerationReport(NamedTuple):
+    """How repetitive a piece of transcript is, and whether that is a failure.
+
+    `token` is the sentence that occurs most often and `share` how much of the
+    transcript it accounts for — the two things worth saying out loud in a log
+    line or an error, since they name what the model got stuck on.
+    """
+
+    flagged: bool
+    longest_run: int
+    unique_ratio: float
+    units: int
+    token: str
+    share: float
+
+
+def transcript_units(text: str) -> list[str]:
+    """Split a transcript into comparable sentence-units.
+
+    Lines are split as well as sentences. Whisper writes one line per decoded
+    segment and does not always punctuate — with these flags a real 30s slice
+    came back as eight unpunctuated lines — so splitting on ". ! ?" alone would
+    score a whole unpunctuated transcript as one unit and see no loop anywhere in
+    it. That is precisely the local-Whisper output the final gate exists to catch.
+
+    Case and whitespace are normalised because the loops are not literal: the
+    2026-09-02 capture alternates "He's good." and "He's good. " across line
+    breaks, and comparing raw strings would score that as 493 distinct units.
+    """
+    units = []
+    for line in text.splitlines():
+        for match in _TRANSCRIPT_UNIT_RE.finditer(line):
+            unit = " ".join(match.group(0).split()).lower()
+            if unit:
+                units.append(unit)
+    return units
+
+
+def degeneration_report(text: str) -> DegenerationReport:
+    """Score `text` for ASR repetition loops. See DEGENERATION_MAX_RUN.
+
+    Pure: no I/O, no logging. Everything that acts on a loop — the per-chunk
+    retry and the final gate — decides from this one report, so there is a
+    single definition of "degenerate" and one place to tune it.
+    """
+    units = transcript_units(text)
+    if not units:
+        return DegenerationReport(False, 0, 1.0, 0, "", 0.0)
+
+    longest_run = run = 1
+    for previous, current in zip(units, units[1:]):
+        run = run + 1 if current == previous else 1
+        longest_run = max(longest_run, run)
+
+    counts = Counter(units)
+    token, count = counts.most_common(1)[0]
+    unique_ratio = len(counts) / len(units)
+    flagged = longest_run >= DEGENERATION_MAX_RUN or (
+        unique_ratio < DEGENERATION_MIN_UNIQUE_RATIO and len(units) >= DEGENERATION_MIN_UNITS)
+    return DegenerationReport(flagged, longest_run, unique_ratio, len(units),
+                              token, count / len(units))
+
+
+def degeneration_detail(report: DegenerationReport) -> str:
+    """One human-readable clause describing a flagged report."""
+    return (f"{report.token!r} repeats {report.longest_run}x in a row and is "
+            f"{report.share:.0%} of {report.units} sentences "
+            f"({report.unique_ratio:.0%} unique)")
+
+
 def transcribe_audio(audio: Path) -> Path:
     out_dir = audio.with_suffix("")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1888,6 +1989,23 @@ def transcribe_audio(audio: Path) -> Path:
             log(f"openrouter transcription failed ({exc}); falling back to local whisper")
     if raw_txt is None:
         raw_txt = transcribe_with_whisper(audio, out_dir)
+
+    # Last gate before anything is built on this text. It sits here rather than
+    # inside the OpenRouter path so that it also covers local Whisper — four of
+    # the nine bad captures in the archive are Whisper's — and so that a looped
+    # cloud transcript falls back to a full local pass first. Failing loudly is
+    # the point: on 2026-09-02 the cleanup took 493 copies of "He's good." and
+    # amplified them to 843 in the filed notes, and on 2026-08-26 the looped tail
+    # flipped speaker labels and lost who owned the budget action item. A visible
+    # failure keeps the audio and asks for a re-run; a looped recap is worse than
+    # no recap, because it reads as if it were true.
+    report = degeneration_report(raw_txt.read_text(encoding="utf-8", errors="replace"))
+    if report.flagged:
+        raise RuntimeError(
+            f"transcript is a repetition loop, not a meeting: {degeneration_detail(report)}. "
+            f"Both engines produced looped text for this audio. The raw transcript is at "
+            f"{display_path(raw_txt)}; re-run `mrec transcribe {display_path(audio)}` to try again."
+        )
 
     diarized_txt = diarize_with_whisperx(audio, out_dir) if DIARIZE else None
 
@@ -1927,7 +2045,30 @@ def whisper_segment_end(line: str) -> float | None:
 
 
 def transcribe_with_whisper(audio: Path, out_dir: Path) -> Path:
-    """Local Whisper transcription. Returns the raw .txt transcript path."""
+    """Local Whisper transcription of a whole recording. Returns the raw .txt path.
+
+    Thin wrapper: this is the variant that owns the job state the menu bar reads,
+    so it is the one to call for a recording and the wrong one to call for a
+    single chunk (see whisper_transcribe_file).
+    """
+    log_section("transcription started", audio_file=display_path(audio),
+                output_dir=display_path(out_dir), engine="whisper")
+    write_transcribe_engine("whisper", WHISPER_MODEL)
+    total = audio_duration_seconds(audio) or 0.0
+    return whisper_transcribe_file(
+        audio, out_dir, on_progress=lambda done: write_transcribe_progress(done, total))
+
+
+def whisper_transcribe_file(audio: Path, out_dir: Path,
+                            *, on_progress: Callable[[float], None] | None = None) -> Path:
+    """Run local Whisper over one audio file. Returns the raw .txt transcript path.
+
+    Deliberately free of global side effects: it never touches the transcribe
+    engine label or the progress file. The degeneration retry calls this for a
+    single chunk mid-run, and writing job state there would flip the menu bar to
+    "whisper" and rewind the progress bar to that chunk's few minutes while the
+    OpenRouter run is still going.
+    """
     cmd = ["whisper", str(audio), "--model", WHISPER_MODEL, "--output_dir", str(out_dir), "--output_format", "all"]
     # Suppress silence hallucinations (see WHISPER_* config above).
     cmd.extend([
@@ -1939,10 +2080,10 @@ def transcribe_with_whisper(audio: Path, out_dir: Path) -> Path:
         cmd.extend(["--hallucination_silence_threshold", WHISPER_HALLUCINATION_SILENCE_THRESHOLD])
     if LANGUAGE:
         cmd.extend(["--language", LANGUAGE])
-    log_section("transcription started", audio_file=display_path(audio), output_dir=display_path(out_dir), engine="whisper")
     log("whisper command: " + shlex.join(cmd))
-    write_transcribe_engine("whisper", WHISPER_MODEL)
-    total = audio_duration_seconds(audio) or 0.0
+    # Own the output directory rather than trusting the caller to have made it:
+    # transcribe_audio does, but the chunk retry passes a fresh per-chunk dir.
+    out_dir.mkdir(parents=True, exist_ok=True)
     # Read the output as it is produced rather than collecting it at the end: on an
     # hour of audio that is the difference between a menu bar that shows progress
     # and one that shows nothing for ninety minutes. PYTHONUNBUFFERED because
@@ -1958,8 +2099,8 @@ def transcribe_with_whisper(audio: Path, out_dir: Path) -> Path:
             log_file.write(line)
             log_file.flush()
             end = whisper_segment_end(line)
-            if end is not None:
-                write_transcribe_progress(end, total)
+            if end is not None and on_progress is not None:
+                on_progress(end)
         returncode = proc.wait()
     if returncode != 0:
         raise RuntimeError(f"whisper failed; see {log_path}")
@@ -2257,10 +2398,15 @@ def transcribe_with_openrouter(audio: Path, out_dir: Path) -> Path:
             # The call was billed whether or not it returned text — record it.
             record_openrouter_cost(model=OPENROUTER_MODEL, usage=usage,
                                    meeting=out_dir.name, chunk=idx)
-            if text:
-                parts.append(text)
             cost = float((usage or {}).get("cost") or 0.0)
             log(f"openrouter chunk {idx + 1}/{nchunks} done ({len(text)} chars, ${cost:.4f})")
+            if text:
+                report = degeneration_report(text)
+                if report.flagged:
+                    log(f"openrouter chunk {idx + 1}/{nchunks} looks degenerate: "
+                        f"{degeneration_detail(report)}; retrying it with local whisper")
+                    text = whisper_retry_chunk(mp3, tmpdir, idx) or text
+                parts.append(text)
             # Chunk boundaries are the only progress this engine has; with the
             # default chunk size that is a menu bar update every few minutes.
             write_transcribe_progress(min(start + OPENROUTER_CHUNK_SECONDS, duration), duration)
@@ -2269,6 +2415,34 @@ def transcribe_with_openrouter(audio: Path, out_dir: Path) -> Path:
     raw_txt = out_dir / f"{audio.stem}.txt"
     raw_txt.write_text("\n".join(parts) + "\n", encoding="utf-8")
     return raw_txt
+
+
+def whisper_retry_chunk(mp3: Path, tmpdir: Path, idx: int) -> str | None:
+    """Re-transcribe one degenerate chunk locally. Returns clean text, or None.
+
+    The chunk's mp3 is already on disk from the transcode, so this costs a local
+    Whisper pass over a few minutes of audio and no re-encode. None means "keep
+    what OpenRouter gave us" — a failed retry should not lose the chunk, and the
+    final gate in transcribe_audio still has the last word on the whole thing.
+    """
+    retry_dir = tmpdir / f"retry_{idx:03d}"
+    retry_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        local_txt = whisper_transcribe_file(mp3, retry_dir)
+        local = local_txt.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception as exc:
+        log(f"local whisper retry of chunk {idx + 1} failed ({exc}); keeping the openrouter text")
+        return None
+    if not local:
+        log(f"local whisper retry of chunk {idx + 1} produced nothing; keeping the openrouter text")
+        return None
+    report = degeneration_report(local)
+    if report.flagged:
+        log(f"local whisper retry of chunk {idx + 1} looped too: "
+            f"{degeneration_detail(report)}; keeping the openrouter text")
+        return None
+    log(f"local whisper retry of chunk {idx + 1} is clean ({len(local)} chars); using it")
+    return local
 
 
 def diarize_with_whisperx(audio: Path, out_dir: Path) -> Path | None:
