@@ -22,7 +22,7 @@ class DetectMeetingMicTests(unittest.TestCase):
         self.addCleanup(self.procs.stop)
 
     def test_slack_holding_mic_is_a_huddle(self):
-        with mock.patch.object(m, "mic_input_holders", return_value=[(42, "Slack")]):
+        with mock.patch.object(m, "mic_input_holders", return_value=[(42, "Slack", "Slack")]):
             self.assertEqual(m.detect_meeting(), "Slack Huddle")
 
     def test_slack_merely_running_is_not_a_meeting(self):
@@ -32,19 +32,32 @@ class DetectMeetingMicTests(unittest.TestCase):
 
     def test_unwatched_mic_user_is_ignored(self):
         """Dictation or Voice Memos must not start a recording."""
-        with mock.patch.object(m, "mic_input_holders", return_value=[(7, "VoiceMemos")]):
+        with mock.patch.object(m, "mic_input_holders", return_value=[(7, "VoiceMemos", "VoiceMemos")]):
             self.assertIsNone(m.detect_meeting())
 
     def test_browser_tab_wins_over_mic(self):
         """A Meet tab should keep its own label even if Slack holds the mic."""
         with mock.patch.object(m, "browser_tabs",
                                return_value=[("Safari", "https://meet.google.com/abc", "Standup")]), \
-             mock.patch.object(m, "mic_input_holders", return_value=[(42, "Slack")]):
+             mock.patch.object(m, "mic_input_holders", return_value=[(42, "Slack", "Slack")]):
             self.assertIn("Standup", m.detect_meeting())
+
+    def test_a_helper_process_counts_through_its_app(self):
+        """Electron and WebKit apps hold the mic from helper processes; the
+        app column is what names the huddle."""
+        with mock.patch.object(m, "mic_input_holders",
+                               return_value=[(42, "Slack Helper (Renderer)", "Slack")]):
+            self.assertEqual(m.detect_meeting(), "Slack Huddle")
+
+    def test_a_browser_on_the_mic_does_not_start_a_recording(self):
+        """Browsers are deliberately not in MIC_HINTS: dictation is not a meeting."""
+        with mock.patch.object(m, "mic_input_holders",
+                               return_value=[(2508, "com.apple.WebKit.GPU", "DuckDuckGo")]):
+            self.assertIsNone(m.detect_meeting())
 
     def test_mic_detection_can_be_disabled(self):
         with mock.patch.object(m, "MIC_DETECT", False), \
-             mock.patch.object(m, "mic_input_holders", return_value=[(42, "Slack")]) as holders:
+             mock.patch.object(m, "mic_input_holders", return_value=[(42, "Slack", "Slack")]) as holders:
             self.assertIsNone(m.detect_meeting())
             holders.assert_not_called()
 
@@ -58,20 +71,26 @@ class MicInputHoldersTests(unittest.TestCase):
              mock.patch.object(m, "run", return_value=result):
             return m.mic_input_holders(use_cache=False)
 
-    def test_parses_pid_and_name(self):
-        self.assertEqual(self._run_with_probe_output("42\tSlack\n"), [(42, "Slack")])
+    def test_parses_pid_name_and_owning_app(self):
+        out = "42\tSlack Helper (Renderer)\tSlack\n2508\tcom.apple.WebKit.GPU\tDuckDuckGo\n"
+        self.assertEqual(self._run_with_probe_output(out),
+                         [(42, "Slack Helper (Renderer)", "Slack"), (2508, "com.apple.WebKit.GPU", "DuckDuckGo")])
+
+    def test_probe_output_without_an_app_column_repeats_the_name(self):
+        """An older mic-probe binary prints two columns; keep reading it."""
+        self.assertEqual(self._run_with_probe_output("42\tSlack\n"), [(42, "Slack", "Slack")])
 
     def test_excludes_own_capture(self):
         """Without this the recorder sees itself and never stops recording."""
-        out = "42\tSlack\n99\tffmpeg\n100\tsck-recorder\n729\treplayd\n"
-        self.assertEqual(self._run_with_probe_output(out), [(42, "Slack")])
+        out = "42\tSlack\tSlack\n99\tffmpeg\tffmpeg\n100\tsck-recorder\tpython3\n729\treplayd\treplayd\n"
+        self.assertEqual(self._run_with_probe_output(out), [(42, "Slack", "Slack")])
 
     def test_probe_failure_is_not_fatal(self):
         """Mic detection is additive; losing it must not lose other meetings."""
         self.assertEqual(self._run_with_probe_output("", returncode=1), [])
 
     def test_malformed_lines_are_skipped(self):
-        self.assertEqual(self._run_with_probe_output("junk\n\n42\tSlack\nxx\tBad\n"), [(42, "Slack")])
+        self.assertEqual(self._run_with_probe_output("junk\n\n42\tSlack\nxx\tBad\n"), [(42, "Slack", "Slack")])
 
 
 if __name__ == "__main__":
