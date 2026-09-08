@@ -5,10 +5,18 @@
 // all day, so "is Slack running" says nothing; "is Slack holding the mic right
 // now" is the signal that tracks an actual huddle.
 //
-// Prints one `pid<TAB>executable-name` line per process running an input stream,
-// and exits 0 even when nothing is (empty output is a valid answer). Exit 1 is
-// reserved for "this machine cannot answer the question", so the caller can tell
-// "no huddle" apart from "detection is broken".
+// Prints one `pid<TAB>executable-name<TAB>owning-app` line per process running
+// an input stream, and exits 0 even when nothing is (empty output is a valid
+// answer). Exit 1 is reserved for "this machine cannot answer the question", so
+// the caller can tell "no huddle" apart from "detection is broken".
+//
+// The owning app is the *responsible* process — the app a helper belongs to.
+// A WebKit browser never holds the mic itself: a Meet call in DuckDuckGo shows
+// up as `com.apple.WebKit.GPU`, an XPC service whose parent is launchd, so
+// neither the name nor the ppid says which browser is on the call. macOS tracks
+// that as the responsible pid (it is what TCC attributes permissions to). The
+// lookup is a private libsystem call, resolved at run time; when it is missing
+// the third column repeats the executable name.
 //
 // Uses the CoreAudio process-object API (macOS 14.4+), which gives per-process
 // attribution. The older kAudioDevicePropertyDeviceIsRunningSomewhere is device
@@ -49,10 +57,25 @@ func uint32Property(_ object: AudioObjectID, _ selector: AudioObjectPropertySele
     return value
 }
 
+typealias ResponsibleFn = @convention(c) (pid_t) -> pid_t
+let responsibleFor: ResponsibleFn? = {
+    guard let handle = dlopen(nil, RTLD_NOW),
+          let symbol = dlsym(handle, "responsibility_get_pid_responsible_for_pid") else { return nil }
+    return unsafeBitCast(symbol, to: ResponsibleFn.self)
+}()
+
 func executableName(_ pid: pid_t) -> String {
     var buffer = [CChar](repeating: 0, count: 4096)
     guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return "" }
     return (String(cString: buffer) as NSString).lastPathComponent
+}
+
+func owningApp(_ pid: pid_t, fallback: String) -> String {
+    guard let lookup = responsibleFor else { return fallback }
+    let owner = lookup(pid)
+    if owner <= 0 || owner == pid { return fallback }
+    let name = executableName(owner)
+    return name.isEmpty ? fallback : name
 }
 
 guard let objects = processObjectIDs() else {
@@ -66,7 +89,8 @@ for object in objects {
     guard let running = uint32Property(object, kAudioProcessPropertyIsRunningInput), running != 0 else { continue }
     guard let raw = uint32Property(object, kAudioProcessPropertyPID) else { continue }
     let pid = pid_t(bitPattern: raw)
-    out += "\(pid)\t\(executableName(pid))\n"
+    let name = executableName(pid)
+    out += "\(pid)\t\(name)\t\(owningApp(pid, fallback: name))\n"
 }
 FileHandle.standardOutput.write(out.data(using: .utf8)!)
 exit(0)

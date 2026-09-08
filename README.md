@@ -49,14 +49,47 @@ Disable it entirely:
 export MEETING_RECORDER_MIC_DETECT=0
 ```
 
+The probe reports the process on the mic *and the app it belongs to*: Slack and
+WebKit browsers hold the mic from helper processes (`Slack Helper (Renderer)`,
+`com.apple.WebKit.GPU`) whose parent is launchd, so the executable name alone
+never says whose call it is. The app column comes from macOS's own
+responsible-process bookkeeping — the same attribution TCC uses.
+
+### Keeping a browser meeting recording until it ends
+
+Once a recording has started from a browser tab, the tab list is no longer the
+only thing keeping it alive. Tab detection is only as good as the browser's
+view of its own windows at that instant, and that view has holes: the
+accessibility walk that reads DuckDuckGo's tab strip trips when a window
+changes under it (a popover closing, a second window opening), and a scripting
+call can time out while the call is chewing the CPU. Each hole used to look
+like the meeting ending: after `MEETING_RECORDER_END_GRACE_SECONDS` the
+recording was cut and transcribed mid-call, then offered again as a "new
+meeting" the moment the tabs came back — the 2026-09-08 standup was split
+in two this way, with nothing in the log to say why.
+
+So while recording, the meeting counts as still on if **either** a detector
+sees it **or the browser it was found in still holds the microphone**. A
+browser in a call holds the mic for as long as the call lasts and releases it
+when you leave, so the recording ends when the meeting does, not when the tab
+strip blinks. The log says which signal is carrying the recording whenever
+that changes (`meeting tab not visible (DuckDuckGo: 1 window, 2 tabs) but
+DuckDuckGo holds the mic; keeping the recording`).
+
+This only ever *continues* a recording. Browsers stay out of `MIC_HINTS`, so a
+browser on the mic — dictation, a voice note — never starts one. It follows
+`MEETING_RECORDER_MIC_DETECT` like the rest of the mic signal.
+
 ### Known limitation
 
-If Slack releases the input stream while you are **muted**, a long muted stretch
-looks like the huddle ended and the recording stops after the grace period. This
-has not been confirmed either way — use `mrec mic-probe --watch`, join a huddle
-and toggle mute to check. If it turns out Slack does release on mute, the fix is
-to hold the "in a meeting" state for a longer grace period on the mic signal
-specifically.
+If an app releases the input stream while you are **muted**, a long muted
+stretch looks like the call ended and the recording stops after the grace
+period. For Slack this has not been confirmed either way — use `mrec mic-probe
+--watch`, join a huddle and toggle mute to check. For a browser meeting it only
+matters while the tab is *also* out of view, since a visible tab keeps the
+recording going on its own. If it turns out an app does release on mute, the
+fix is to hold the "in a meeting" state for a longer grace period on the mic
+signal specifically.
 
 ## Commands
 

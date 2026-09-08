@@ -955,37 +955,77 @@ def parse_tab_rows(app: str, out: str) -> list[tuple[str, str, str]]:
 # page as well and took ~4.5s per poll; the fixed three-level walk takes ~0.8s.
 # Anything that is not a tab (the "Open a new tab" button) has a different
 # accessibility description and is dropped.
+#
+# Every window is walked inside its own `try`. `repeat with x in (UI elements
+# of w)` re-resolves `item i of ...` on each pass, so a window that changes
+# under the walk — a popover closing, a sheet going away, a second window being
+# opened mid-call — raises "Invalid index" (-1719); without the per-window
+# guard that one window aborted the whole script and every tab in every other
+# window went unseen, which read as "the meeting ended".
+#
+# The output starts with the number of windows walked so a caller can tell
+# "no windows to read" from "windows, but no meeting tab in them".
 def ax_tab_script(app: str) -> str:
-    """AppleScript listing every tab title of `app` from the accessibility tree."""
+    """AppleScript listing every tab title of `app` from the accessibility tree.
+
+    Returns `<window count>` then one tab title per row, TAB_ROW_SEP-separated.
+    """
     return f'''
         tell application "System Events"
           if exists (process {applescript_quote(app)}) then
             tell process {applescript_quote(app)}
               set tabRows to ""
-              repeat with w in windows
-                repeat with a in (UI elements of w)
-                  repeat with b in (UI elements of a)
-                    repeat with c in (UI elements of b)
-                      try
-                        if (role of c as text) is "AXTabGroup" then
-                          repeat with t in (UI elements of c)
-                            try
-                              if (description of t as text) is "Tab" then
-                                set tabRows to tabRows & (name of t as text) & (character id 30)
-                              end if
-                            end try
-                          end repeat
-                        end if
-                      end try
+              set windowCount to 0
+              set ws to {{}}
+              try
+                set ws to windows
+              end try
+              repeat with w in ws
+                set windowCount to windowCount + 1
+                try
+                  repeat with a in (UI elements of w)
+                    repeat with b in (UI elements of a)
+                      repeat with c in (UI elements of b)
+                        try
+                          if (role of c as text) is "AXTabGroup" then
+                            repeat with t in (UI elements of c)
+                              try
+                                if (description of t as text) is "Tab" then
+                                  set tabRows to tabRows & (character id 30) & (name of t as text)
+                                end if
+                              end try
+                            end repeat
+                          end if
+                        end try
+                      end repeat
                     end repeat
                   end repeat
-                end repeat
+                end try
               end repeat
-              return tabRows
+              return (windowCount as text) & tabRows
             end tell
           end if
         end tell
     '''
+
+
+def parse_ax_output(out: str) -> tuple[int | None, list[str]]:
+    """Split ax_tab_script output into (windows walked, tab titles).
+
+    The window count is None when the app was not running (the script returns
+    nothing at all then) — distinct from a running app with zero windows.
+    """
+    head, _, rest = out.partition(TAB_ROW_SEP)
+    head = head.strip()
+    if not head:
+        return None, []
+    if not head.isdigit():
+        # Output from a script without the header; treat it all as titles.
+        rest = out
+        count = None
+    else:
+        count = int(head)
+    return count, [title.strip() for title in rest.split(TAB_ROW_SEP) if title.strip()]
 
 
 def parse_ax_tab_rows(app: str, out: str) -> list[tuple[str, str, str]]:
@@ -995,12 +1035,26 @@ def parse_ax_tab_rows(app: str, out: str) -> list[tuple[str, str, str]]:
     only ever match on the title, which is why TITLE_HINTS has to cover every
     platform this path is expected to catch.
     """
-    return [(app, "", title.strip()) for title in out.split(TAB_ROW_SEP) if title.strip()]
+    _count, titles = parse_ax_output(out)
+    return [(app, "", title) for title in titles]
 
 
 # Accessibility is granted per launching process, so the daemon can be denied
 # while a shell is allowed. Log that once rather than every poll.
 _AX_DENIED_LOGGED: set[str] = set()
+# What the last accessibility read of each app came back with ("2 windows, 5
+# tabs", "error: ..."), so the watcher can say *why* a meeting stopped being
+# visible instead of just that it did.
+_AX_LAST: dict[str, str] = {}
+# Non-permission failures used to go to the log on every poll (or, worse, were
+# mistaken for a permission denial and logged once, ever). Throttle instead: the
+# first occurrence and then one line per window per app.
+_AX_ERROR_LOG_SECONDS = 300.0
+_AX_ERROR_LOGGED_AT: dict[str, float] = {}
+
+
+def ax_last_summary(app: str) -> str:
+    return _AX_LAST.get(app, "not read yet")
 
 
 def ax_browser_tabs(app: str) -> list[tuple[str, str, str]]:
@@ -1008,16 +1062,30 @@ def ax_browser_tabs(app: str) -> list[tuple[str, str, str]]:
         out = osascript(ax_tab_script(app), timeout=8)
     except Exception as exc:
         message = str(exc)
-        denied = "-1719" in message or "not allowed" in message.lower() or "assistive" in message.lower()
-        if not denied:
-            log(f"could not inspect {app}: {exc}")
-        elif app not in _AX_DENIED_LOGGED:
-            _AX_DENIED_LOGGED.add(app)
-            log(f"cannot read {app} tabs: grant Accessibility to this process "
-                f"(System Settings > Privacy & Security > Accessibility); meetings in {app} "
-                f"will not be detected until then")
+        # Only the errors System Events raises for a missing grant. "Invalid
+        # index" (-1719) is NOT one of them — it is what a window vanishing under
+        # the walk raises — and treating it as a denial silenced every later
+        # failure for the life of the daemon.
+        denied = "-25211" in message or "not allowed" in message.lower() or "assistive" in message.lower()
+        _AX_LAST[app] = f"error: {message.strip()[:160]}"
+        if denied:
+            if app not in _AX_DENIED_LOGGED:
+                _AX_DENIED_LOGGED.add(app)
+                log(f"cannot read {app} tabs: grant Accessibility to this process "
+                    f"(System Settings > Privacy & Security > Accessibility); meetings in {app} "
+                    f"will not be detected until then ({message.strip()[:160]})")
+        else:
+            now = time.monotonic()
+            if now - _AX_ERROR_LOGGED_AT.get(app, -_AX_ERROR_LOG_SECONDS) >= _AX_ERROR_LOG_SECONDS:
+                _AX_ERROR_LOGGED_AT[app] = now
+                log(f"could not inspect {app}: {message.strip()[:300]}")
         return []
-    return parse_ax_tab_rows(app, out)
+    count, titles = parse_ax_output(out)
+    if count is None:
+        _AX_LAST[app] = "not running"
+    else:
+        _AX_LAST[app] = f"{count} window{'s' if count != 1 else ''}, {len(titles)} tab{'s' if len(titles) != 1 else ''}"
+    return [(app, "", title) for title in titles]
 
 
 def browser_tabs() -> list[tuple[str, str, str]]:
@@ -1055,11 +1123,16 @@ def ensure_mic_probe_built() -> Path:
     return MIC_PROBE_BIN
 
 
-_MIC_CACHE: tuple[float, list[tuple[int, str]]] | None = None
+_MIC_CACHE: tuple[float, list[tuple[int, str, str]]] | None = None
 
 
-def mic_input_holders(*, use_cache: bool = True) -> list[tuple[int, str]]:
-    """Processes currently holding a microphone input stream, as (pid, name).
+def mic_input_holders(*, use_cache: bool = True) -> list[tuple[int, str, str]]:
+    """Processes currently holding a microphone input stream, as (pid, name, app).
+
+    `name` is the process holding the stream and `app` the application it
+    belongs to. They differ for helpers: a Meet call in DuckDuckGo holds the mic
+    from `com.apple.WebKit.GPU`, and only the app column says it is DuckDuckGo's.
+    Older probe output without the column repeats the name.
 
     Excludes our own capture stack: while recording, ffmpeg/sck-recorder hold the
     mic, and counting them would make the recorder detect itself and never stop.
@@ -1070,20 +1143,21 @@ def mic_input_holders(*, use_cache: bool = True) -> list[tuple[int, str]]:
     now = time.monotonic()
     if use_cache and _MIC_CACHE is not None and now - _MIC_CACHE[0] < MIC_PROBE_CACHE_SECONDS:
         return _MIC_CACHE[1]
-    holders: list[tuple[int, str]] = []
+    holders: list[tuple[int, str, str]] = []
     try:
         proc = run([str(ensure_mic_probe_built())], timeout=10)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or f"exit {proc.returncode}")
         for line in proc.stdout.splitlines():
-            pid_text, _, name = line.partition("\t")
-            if not name.strip():
+            pid_text, name, app = (line.split("\t") + ["", ""])[:3]
+            name, app = name.strip(), app.strip() or name.strip()
+            if not name:
                 continue
             # Our own capture, and the audio daemons that proxy it, are not meetings.
-            if any(s.lower() in name.lower() for s in MIC_SELF_PROCESSES):
+            if any(s.lower() in f"{name} {app}".lower() for s in MIC_SELF_PROCESSES):
                 continue
             try:
-                holders.append((int(pid_text), name.strip()))
+                holders.append((int(pid_text), name, app))
             except ValueError:
                 continue
     except Exception as exc:
@@ -1122,10 +1196,52 @@ def detect_meeting() -> str | None:
     # Last: apps that only reveal a call by taking the mic (Slack huddles etc.).
     # Checked after the cheaper detectors so a Meet tab still wins the label.
     if MIC_DETECT:
-        for _pid, name in mic_input_holders():
+        for _pid, name, app in mic_input_holders():
             for hint, label in MIC_HINTS:
-                if hint.lower() in name.lower():
+                if hint.lower() in f"{name} {app}".lower():
                     return label
+    return None
+
+
+def meeting_source_app(reason: str) -> str | None:
+    """The browser a tab-detected meeting lives in ("DuckDuckGo: Meet – X"), else None."""
+    app, sep, _title = reason.partition(": ")
+    if sep and (app in BROWSER_APPS or app in AX_TAB_APPS):
+        return app
+    return None
+
+
+def meeting_app_holds_mic(reason: str) -> bool:
+    """True while the browser the meeting was found in is still on the mic.
+
+    Tab detection is only as good as the browser's view of its own windows,
+    and that view has holes: an accessibility walk that trips on a window
+    changing under it, a scripting call that times out while the call chews
+    the CPU. Each hole looked like the meeting ending, and after END_GRACE_SECONDS
+    the recording was cut and transcribed mid-call — then offered again as a new
+    meeting once the tabs came back. A browser in a call holds the microphone
+    for as long as the call lasts, so while it does, the meeting is still on
+    whatever the tab list says.
+
+    Only the *continuation* decision trusts the mic: browsers stay out of
+    MIC_HINTS so dictation never starts a recording.
+    """
+    app = meeting_source_app(reason)
+    if not app or not MIC_DETECT:
+        return False
+    return any(app.lower() in f"{name} {owner}".lower() for _pid, name, owner in mic_input_holders())
+
+
+def meeting_still_on(reason: str) -> str | None:
+    """How the meeting being recorded for `reason` is currently visible, or None.
+
+    "detected" when any detector still sees a meeting; "<app> holds the mic"
+    when the tab is out of view but the browser is still in the call.
+    """
+    if detect_meeting():
+        return "detected"
+    if meeting_app_holds_mic(reason):
+        return f"{meeting_source_app(reason)} holds the mic"
     return None
 
 
@@ -2770,6 +2886,7 @@ def watch() -> None:
             notify("Meeting Recorder", f"Recording {short_meeting_label(reason)}.")
             last_seen = time.time()
             last_check_in = time.time()
+            seen_how: str | None = "detected"
             while True:
                 if stop_requested():
                     log("stop requested (mrec stop-recording); stopping and transcribing")
@@ -2788,7 +2905,20 @@ def watch() -> None:
                         "same time.)",
                     )
                     break
-                current = detect_meeting()
+                current = meeting_still_on(reason)
+                if current != seen_how:
+                    # Say what changed, once per change: the tab list going
+                    # dark while the browser is still on the call is the case
+                    # that used to end recordings mid-meeting.
+                    source = meeting_source_app(reason)
+                    detail = f" ({source}: {ax_last_summary(source)})" if source in AX_TAB_APPS else ""
+                    if current is None:
+                        log(f"meeting not visible{detail}; stopping in {END_GRACE_SECONDS}s unless it comes back")
+                    elif current == "detected":
+                        log(f"meeting visible again{detail}")
+                    else:
+                        log(f"meeting tab not visible{detail} but {current}; keeping the recording")
+                    seen_how = current
                 if current:
                     last_seen = time.time()
                 elif time.time() - last_seen >= END_GRACE_SECONDS:
@@ -3560,10 +3690,16 @@ def print_mic_probe(watch_mode: bool = False, interval: float = 2.0) -> int:
         holders = mic_input_holders(use_cache=False)
         stamp = dt.datetime.now().strftime("%H:%M:%S")
         if holders:
-            for pid, name in holders:
-                match = next((label for hint, label in MIC_HINTS if hint.lower() in name.lower()), None)
-                print(f"[{stamp}] mic in use: {name} (pid {pid})"
-                      + (f"  -> would record as \"{match}\"" if match else "  (not a watched app)"))
+            for pid, name, app in holders:
+                match = next((label for hint, label in MIC_HINTS if hint.lower() in f"{name} {app}".lower()), None)
+                who = name if app == name else f"{name} of {app}"
+                if match:
+                    verdict = f"  -> would record as \"{match}\""
+                elif app in BROWSER_APPS or app in AX_TAB_APPS:
+                    verdict = f"  (keeps a recording of a {app} tab going; never starts one)"
+                else:
+                    verdict = "  (not a watched app)"
+                print(f"[{stamp}] mic in use: {who} (pid {pid}){verdict}")
         else:
             print(f"[{stamp}] no process is holding the microphone")
         if not watch_mode:
